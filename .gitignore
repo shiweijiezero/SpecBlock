@@ -1,0 +1,65 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+.cursorignore
+.cursorindexingignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Training artifacts
+wandb/
+outputs/
+checkpoints/
+cache/
+logs/
+*.log
+tmp/
+
+# Model weights (large, downloaded separately)
+model/
+models/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Datasets (downloaded separately)
+data/
+datasets/
+*.jsonl
+*.arrow
+
+# JIT / build caches
+.cache/
+*.cubin
+*.ptx
