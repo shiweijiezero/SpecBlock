@@ -2,18 +2,18 @@ from setuptools import find_packages, setup
 
 
 def read_requirements():
-    with open(f"requirements.txt", "r") as f:
+    with open("requirements.txt", "r", encoding="utf-8") as f:
         lines = (line.strip() for line in f)
         return [line for line in lines if line and not line.startswith(("#", "--"))]
 
 
 def read_readme():
-    with open("README.md", "r") as f:
+    with open("README.md", "r", encoding="utf-8") as f:
         return f.read()
 
 
 def read_version():
-    with open("version.txt", "r") as f:
+    with open("version.txt", "r", encoding="utf-8") as f:
         return f.read().strip()
 
 
