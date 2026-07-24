@@ -180,6 +180,7 @@ def _single_pos_attn_fwd_kernel(
     stride_o_b, stride_o_h, stride_o_m, stride_o_d,
     scale: tl.constexpr,
     K_SLOTS: tl.constexpr,         # M = K_SLOTS for single-position path
+    BLOCK_M: tl.constexpr,         # padded to >=16 for tl.dot portability
     HAS_TTT: tl.constexpr,
     BLOCK_N: tl.constexpr,
     D: tl.constexpr,
@@ -191,25 +192,28 @@ def _single_pos_attn_fwd_kernel(
       [cross_count, curr_start)    — ttt cache, masked by TTT_mask
       [curr_start, C)              — current K, causal within the K slots
 
-    Because M = K_SLOTS (small, e.g. 4), each program handles all M queries
-    for one (batch, head). Grid is (B, H).
+    Each program handles all M queries for one (batch, head). The physical
+    query tile is padded to BLOCK_M because some Triton backends require every
+    non-batch tl.dot dimension to be at least 16.
     """
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
 
-    offs_m = tl.arange(0, K_SLOTS)
+    offs_m = tl.arange(0, BLOCK_M)
+    m_in_bounds = offs_m < K_SLOTS
     offs_d = tl.arange(0, D)
 
-    # Load Q
+    # Load Q; padded rows participate in the tile but are not stored.
     q_base = Q_ptr + pid_b * stride_q_b + pid_h * stride_q_h
     q = tl.load(
         q_base + offs_m[:, None] * stride_q_m + offs_d[None, :] * stride_q_d,
+        mask=m_in_bounds[:, None], other=0.0,
     )
 
     # Accumulators
-    m_i = tl.full([K_SLOTS], -float('inf'), dtype=tl.float32)
-    l_i = tl.zeros([K_SLOTS], dtype=tl.float32)
-    acc = tl.zeros([K_SLOTS, D], dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
 
     k_base = K_ptr + pid_b * stride_k_b + pid_h * stride_k_h
     v_base = V_ptr + pid_b * stride_v_b + pid_h * stride_v_h
@@ -277,6 +281,7 @@ def _single_pos_attn_fwd_kernel(
     tl.store(
         o_base + offs_m[:, None] * stride_o_m + offs_d[None, :] * stride_o_d,
         acc.to(Out_ptr.dtype.element_ty),
+        mask=m_in_bounds[:, None],
     )
 
 
@@ -317,6 +322,7 @@ def single_pos_attention(q, k_full, v_full, cross_count, ttt_count, ttt_mask,
         stride_ttt_b = 0
         stride_ttt_c = 0
 
+    BLOCK_M = 16 if M <= 16 else 32
     BLOCK_N = 64
     grid = (B, H)
     _single_pos_attn_fwd_kernel[grid](
@@ -329,6 +335,7 @@ def single_pos_attention(q, k_full, v_full, cross_count, ttt_count, ttt_mask,
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         scale=scale,
         K_SLOTS=k_slots,
+        BLOCK_M=BLOCK_M,
         HAS_TTT=has_ttt,
         BLOCK_N=BLOCK_N,
         D=D,
@@ -380,6 +387,7 @@ def _three_part_attn_fwd_kernel(
     stride_o_b, stride_o_h, stride_o_m, stride_o_d,
     scale: tl.constexpr,
     K_SLOTS: tl.constexpr,
+    BLOCK_M: tl.constexpr,         # padded to >=16 for tl.dot portability
     HAS_TTT: tl.constexpr,
     BLOCK_N: tl.constexpr,
     D: tl.constexpr,
@@ -397,19 +405,21 @@ def _three_part_attn_fwd_kernel(
     pid_h = tl.program_id(1)
     pid_kh = pid_h // n_kv_groups
 
-    offs_m = tl.arange(0, K_SLOTS)
+    offs_m = tl.arange(0, BLOCK_M)
+    m_in_bounds = offs_m < K_SLOTS
     offs_d = tl.arange(0, D)
 
-    # Load Q
+    # Load Q; padded rows participate in the tile but are not stored.
     q_base = Q_ptr + pid_b * stride_q_b + pid_h * stride_q_h
     q = tl.load(
         q_base + offs_m[:, None] * stride_q_m + offs_d[None, :] * stride_q_d,
+        mask=m_in_bounds[:, None], other=0.0,
     )
 
     # Online softmax state (carried across 3 region loops)
-    m_i = tl.full([K_SLOTS], -float('inf'), dtype=tl.float32)
-    l_i = tl.zeros([K_SLOTS], dtype=tl.float32)
-    acc = tl.zeros([K_SLOTS, D], dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], -float('inf'), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
 
     # ---- Loop 1: cross region (all visible) ----
     # cross_k stride_ck_b may be 0 (broadcast view) -> identical pointer for all batches.
@@ -501,6 +511,7 @@ def _three_part_attn_fwd_kernel(
     tl.store(
         o_base + offs_m[:, None] * stride_o_m + offs_d[None, :] * stride_o_d,
         acc.to(Out_ptr.dtype.element_ty),
+        mask=m_in_bounds[:, None],
     )
 
 
@@ -557,6 +568,7 @@ def three_part_attention(
         tk_strides = (ttt_k.stride(0), ttt_k.stride(1), ttt_k.stride(2), ttt_k.stride(3))
         tv_strides = (ttt_v.stride(0), ttt_v.stride(1), ttt_v.stride(2), ttt_v.stride(3))
 
+    BLOCK_M = 16 if M <= 16 else 32
     BLOCK_N = 64
     grid = (B, H)
     _three_part_attn_fwd_kernel[grid](
@@ -577,6 +589,7 @@ def three_part_attention(
         out.stride(0), out.stride(1), out.stride(2), out.stride(3),
         scale=scale,
         K_SLOTS=k_slots,
+        BLOCK_M=BLOCK_M,
         HAS_TTT=has_ttt,
         BLOCK_N=BLOCK_N,
         D=D,
