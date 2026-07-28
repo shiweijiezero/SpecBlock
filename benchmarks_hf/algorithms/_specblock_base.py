@@ -3900,7 +3900,9 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         full_attn_mask = self._verify_mask_buf[:, :, :N_plus_1, :total_len]
         full_attn_mask.fill_(min_val)
         full_attn_mask[..., :prefix_len] = 0.0
-        full_attn_mask[..., prefix_len:][tree_mask.bool()] = 0.0
+        full_attn_mask[..., prefix_len:].masked_fill_(
+            tree_mask.to(dtype=torch.bool), 0.0
+        )
 
         # Target forward with tree attention.
         # Env-gated SDP backend selection: default (auto-select by PyTorch based on mask
