@@ -28,6 +28,7 @@ import triton
 import triton.language as tl
 
 _DUMMY_MASK = None
+_ATTENTION_BLOCK_N = 32 if "metax" in torch.__version__.lower() else 64
 
 
 @triton.jit
@@ -140,7 +141,7 @@ def tree_attention(q, k_full, v_full, cross_count, k_slots, scale):
 
     # Block sizes — BLOCK_M tuned for small-M decoding
     BLOCK_M = 16 if M <= 16 else 32
-    BLOCK_N = 64
+    BLOCK_N = _ATTENTION_BLOCK_N
 
     out = torch.empty_like(q)
 
@@ -323,7 +324,7 @@ def single_pos_attention(q, k_full, v_full, cross_count, ttt_count, ttt_mask,
         stride_ttt_c = 0
 
     BLOCK_M = 16 if M <= 16 else 32
-    BLOCK_N = 64
+    BLOCK_N = _ATTENTION_BLOCK_N
     grid = (B, H)
     _single_pos_attn_fwd_kernel[grid](
         q, k_full, v_full, ttt_mask_bool, out,
@@ -569,7 +570,7 @@ def three_part_attention(
         tv_strides = (ttt_v.stride(0), ttt_v.stride(1), ttt_v.stride(2), ttt_v.stride(3))
 
     BLOCK_M = 16 if M <= 16 else 32
-    BLOCK_N = 64
+    BLOCK_N = _ATTENTION_BLOCK_N
     grid = (B, H)
     _three_part_attn_fwd_kernel[grid](
         q,
@@ -714,7 +715,7 @@ def tree_attention_gqa(q, k, v, cross_count, k_slots, scale):
     group_size = Hq // Hkv
 
     BLOCK_M = 16 if M <= 16 else 32
-    BLOCK_N = 64
+    BLOCK_N = _ATTENTION_BLOCK_N
 
     out = torch.empty_like(q)
 
