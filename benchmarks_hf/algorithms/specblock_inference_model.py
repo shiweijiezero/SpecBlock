@@ -1,11 +1,12 @@
 """
-SpecBlock Inference Model with KV Cache.
+SpecBlock Shift Inference Model with KV Cache
 
-Includes shift mechanism — cross-slot hidden injection between decoder layers.
-layer_idx > 0: slot k receives slot k-1's previous-layer hidden, fused via
-concat(hidden, shifted) + Linear(2H, H).
+在 SpecBlockInferenceModel 基础上增加 shift 机制：
+在 decoder layers 之间注入 slot 间信息传递。
+layer_idx > 0 时，将 slot k-1 的前一层输出注入到 slot k，
+通过 concat(hidden, shifted) + Linear(2H, H) 融合。
 
-Weight-compatible with training model at specforge/modeling/draft/llama3_specblock.py.
+与训练模型 specforge/modeling/draft/llama3_specblock.py 权重兼容。
 """
 
 import os
@@ -47,9 +48,9 @@ def _shift_proj_forward(hidden, shifted, proj):
 
 
 class SpecBlockInferenceModel(_SpecBlockInferenceModelBase):
-    """SpecBlock model for inference with KV cache.
+    """SpecBlock Shift model for inference with KV cache.
 
-    Extends the internal base with shift_proj layers that inject
+    Extends _SpecBlockInferenceModelBase with shift_proj layers that inject
     cross-slot hidden state information between consecutive decoder layers.
     """
 
@@ -163,6 +164,80 @@ class SpecBlockInferenceModel(_SpecBlockInferenceModelBase):
             _sim._PROFILE_EVENTS.append(("fwd_rank_head", _ev_rh_s, _ev_rh_e))
 
         return logits, rank_logits, draft_hidden, new_ttt_kv
+
+    def forward_block2_ragged(
+        self,
+        hidden,
+        input_ids,
+        cache,
+        pos_ids,
+        max_position: int,
+        ttt_cache,
+        ttt_mask,
+        leaf_owner,
+        max_cross_count: int,
+    ):
+        """Run all heterogeneous shifted block-2 leaves in one model call."""
+        leaves = hidden.shape[0]
+        if hidden.shape[1] != 1 or input_ids.shape != (leaves, 1):
+            raise ValueError("block-2 ragged inputs must contain one position per leaf")
+        if pos_ids.shape != (leaves, self.K):
+            raise ValueError("block-2 position ids must have shape [leaves, K]")
+        if ttt_mask.shape != (leaves, self.K):
+            raise ValueError("block-2 TTT mask must have shape [leaves, K]")
+        if len(cache) != self.num_layers or len(ttt_cache) != self.num_layers:
+            raise ValueError("block-2 cache lists must have one entry per layer")
+        cross_lengths = cache[0][2]
+        requests = cross_lengths.numel()
+        if leaf_owner.shape != (leaves,) or leaf_owner.dtype != torch.long:
+            raise ValueError("leaf_owner must be a torch.long vector with one entry per leaf")
+        if not leaf_owner.is_contiguous() or not cross_lengths.is_contiguous():
+            raise ValueError("block-2 ragged metadata must be contiguous")
+        owner_valid = (leaf_owner >= 0) & (leaf_owner < requests)
+        torch._assert_async(
+            owner_valid.all(),
+            "block-2 ragged owner is outside request bounds",
+        )
+        owned_cross_lengths = cross_lengths.index_select(0, leaf_owner)
+        torch._assert_async(
+            torch.all(
+                (owned_cross_lengths > 0)
+                & (owned_cross_lengths <= int(max_cross_count))
+            ),
+            "block-2 ragged cache length is outside active owner bounds",
+        )
+
+        x = self.input_layer(hidden, input_ids, use_draft_condition=True)
+        width = self.config.hidden_size
+        new_ttt_kv = []
+        for layer_idx, layer in enumerate(self.layers):
+            if layer_idx > 0:
+                shifted = _apply_shift(x, leaves, 1, self.K, width)
+                x = _shift_proj_forward(x, shifted, self.shift_proj[layer_idx - 1])
+            if cache[layer_idx][2] is not cross_lengths:
+                raise ValueError("all block-2 draft layers must share cross lengths")
+            x, all_kv = layer.forward_block2_ragged(
+                x,
+                cache[layer_idx],
+                pos_ids,
+                max_position,
+                ttt_cache[layer_idx],
+                ttt_mask,
+                leaf_owner,
+                max_cross_count,
+            )
+            new_ttt_kv.append(all_kv)
+
+        draft_hidden = x
+        normed = self.norm(x)
+        logits = self.lm_head(normed)
+        rank_logits = self._rank_forward(normed, logits)
+        return logits, rank_logits, draft_hidden, new_ttt_kv
+
+    def forward_block2_grouped(self, *args, **kwargs):
+        raise RuntimeError(
+            "padded grouped block-2 was removed; use packed ragged block-2"
+        )
 
     def forward_with_cache_graph(self, hidden, input_ids, pos_ids, cache,
                                  rope_max_position, ttt_cache, ttt_mask,
@@ -355,3 +430,81 @@ class SpecBlockInferenceModel(_SpecBlockInferenceModelBase):
         rank_logits = self._rank_forward(normed, logits)
 
         return logits, rank_logits, draft_hidden, new_ttt_kv, start_position + N
+
+    def update_cache_and_draft_ragged(
+        self,
+        hidden_3h,
+        input_ids,
+        cache,
+        start_positions: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        max_position: int,
+        max_total_slots: int,
+    ):
+        """Merged cache update and block-1 forward for heterogeneous requests."""
+        condition = self.input_layer.condition_proj(hidden_3h)
+        return self.update_cache_and_draft_ragged_from_condition(
+            condition,
+            input_ids,
+            cache,
+            start_positions,
+            valid_lengths,
+            max_position,
+            max_total_slots,
+        )
+
+    def update_cache_and_draft_ragged_from_condition(
+        self,
+        condition,
+        input_ids,
+        cache,
+        start_positions: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        max_position: int,
+        max_total_slots: int,
+    ):
+        """Run ragged block-1 forward from an already projected condition."""
+        B, N, _ = condition.shape
+        K = self.K
+        H = self.config.hidden_size
+        valid_slots = valid_lengths * K
+        from .draft_kv_triton import assert_ragged_kv_metadata
+        assert_ragged_kv_metadata(
+            cache[0][2], valid_slots, N * K, max_total_slots,
+        )
+        x = self.input_layer.forward_batch_from_condition(condition, input_ids)
+
+        position_offsets = torch.arange(N, device=x.device, dtype=torch.long)
+        slot_offsets = torch.arange(K, device=x.device, dtype=torch.long)
+        pos_ids = (
+            start_positions[:, None, None]
+            + 1
+            + position_offsets[None, :, None]
+            + slot_offsets[None, None, :]
+        ).reshape(B, N * K)
+
+        new_ttt_kv = []
+        for layer_idx, layer in enumerate(self.layers):
+            if layer_idx > 0:
+                shifted = _apply_shift(x, B, N, K, H)
+                x = _shift_proj_forward(x, shifted, self.shift_proj[layer_idx - 1])
+            x, last_kv = layer.forward_batch_ragged(
+                x,
+                cache[layer_idx],
+                pos_ids,
+                max_position,
+                N,
+                valid_lengths,
+                max_total_slots,
+                return_last_kv=True,
+            )
+            new_ttt_kv.append(last_kv)
+
+        last_position = (valid_lengths - 1).clamp_min(0) * K
+        gather_slots = last_position[:, None] + slot_offsets[None, :]
+        gather_index = gather_slots[:, :, None].expand(B, K, H)
+        draft_hidden = torch.gather(x, 1, gather_index)
+        normed = self.norm(draft_hidden)
+        logits = self.lm_head(normed)
+        rank_logits = self._rank_forward(normed, logits)
+        return logits, rank_logits, draft_hidden, new_ttt_kv

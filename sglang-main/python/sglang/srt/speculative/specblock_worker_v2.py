@@ -1,10 +1,12 @@
-"""SpecBlock native V2 worker — mirrors EAGLEWorkerV2 pattern.
+"""SpecBlock-Shift native V2 worker — mirrors EAGLEWorkerV2 pattern.
 
-Decouples prepare and forward phases so the overlap scheduler can pipeline
-draft preparation with the previous iteration's forward pass, recovering the
-sched gap that a monolithic forward_batch_generation cannot expose.
+P2.6 (2026-05-09): replaces the P2.5 adapter approach (delegate V1 via
+ModelWorkerBatch-as-ScheduleBatch shim) which delivered acc parity but
+zero bs=4 throughput gain because V1's monolithic forward_batch_generation
+runs sequentially without exposing prepare-vs-forward seams the overlap
+scheduler can exploit.
 
-Mirrors :class:`EAGLEWorkerV2`:
+This file mirrors :class:`EAGLEWorkerV2` (eagle_worker_v2.py:575-860):
   - forward_batch_generation dispatches three modes (extend / idle / decode)
     and explicitly orchestrates: target_forward → _draft_extend_for_prefill
     (extend), draft_worker.draft → verify → _draft_extend_for_decode
@@ -31,11 +33,13 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
@@ -54,18 +58,50 @@ from sglang.srt.speculative.spec_utils import draft_tp_context
 logger = logging.getLogger(__name__)
 
 
-def _get_plan_stream(device: str) -> Tuple[Optional[torch.cuda.Stream], object]:
-    """Helper mirroring eagle_worker_v2._get_plan_stream.
+def _pack_verified_ids_for_scheduler(
+    verified_ids: torch.Tensor,
+    accept_lens: torch.Tensor,
+    stride: int,
+) -> torch.Tensor:
+    """Pack flattened accepted paths into V2's fixed per-request stride."""
+    if verified_ids.ndim != 1 or accept_lens.ndim != 1:
+        raise RuntimeError(
+            "SpecBlock V2 scheduler packing expects flat verified IDs and "
+            "one accept length per request."
+        )
+    if stride <= 0:
+        raise RuntimeError(f"Invalid SpecBlock V2 scheduler stride {stride}.")
 
-    Returns (plan_stream, plan_stream_ctx).  When the device supports a
-    second compute stream (CUDA), prepare-side work runs there; otherwise
-    falls back to a no-op context manager.
+    accept_lens = accept_lens.to(device=verified_ids.device, dtype=torch.int64)
+    source = torch.arange(
+        verified_ids.numel(), device=verified_ids.device, dtype=torch.int64
+    )
+    ends = torch.cumsum(accept_lens, dim=0)
+    rows = torch.searchsorted(ends, source, right=True)
+    starts = ends - accept_lens
+    destinations = rows * stride + source - starts[rows]
+    packed = torch.zeros(
+        accept_lens.numel() * stride,
+        device=verified_ids.device,
+        dtype=torch.int64,
+    )
+    packed.scatter_(0, destinations, verified_ids.to(torch.int64))
+    return packed
+
+
+def _get_plan_stream(device: str) -> Tuple[Optional[torch.cuda.Stream], object]:
+    """Create the optional verification-plan stream used by Spec V2.
+
+    Match EAGLE V2's feature gate: when overlap planning is disabled, the
+    preparation code still runs in-order under a null context.  Keeping this
+    branch explicit makes the no-overlap path a correctness baseline.
     """
-    if torch.cuda.is_available() and device == "cuda":
-        stream = torch.cuda.Stream()
-        ctx = torch.cuda.stream(stream)
-        return stream, ctx
+    if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
+        device_module = torch.get_device_module(device)
+        stream = device_module.Stream()
+        return stream, device_module.stream(stream)
     from contextlib import nullcontext
+
     return None, nullcontext()
 
 
@@ -282,6 +318,7 @@ class SpecBlockDraftWorker(BaseDraftWorker):
             batch_result.logits_output,
             verified_id_filtered,
             batch_result.accept_length_per_req_cpu,
+            accept_lengths_gpu=verify_info.accept_length,
         )
         # V1 sets sb.spec_info = new_spec_info (shim writes through).
         next_draft_input = batch.spec_info
@@ -321,10 +358,9 @@ class SpecBlockWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # SpecBlock-Shift internally uses K=4 slots × beam_width branching
-        # (set by draft model config); the EAGLE-style topk arg is unused
-        # in the SpecBlock path. Permit any value to keep V1/V2
-        # config-compat — the topk has no effect on the actual draft tree.
+        # SpecBlock-Shift reuses the EAGLE-style topk argument as its slot-0
+        # beam width. It is not EAGLE's per-step tree semantics, but the V1
+        # worker and GPU tree builder consume it, so V2 must preserve the value.
 
         self.server_args = server_args
         self.gpu_id = gpu_id
@@ -379,6 +415,14 @@ class SpecBlockWorkerV2(BaseSpecWorker):
 
         # plan_stream for prepare-stage overlap (mirror EAGLEWorkerV2:171).
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        logger.info(
+            "SpecBlockWorkerV2 initialized (plan_stream_enabled=%s, "
+            "steps=%d, beam_width=%d, verify_tokens=%d)",
+            self.plan_stream is not None,
+            self.speculative_num_steps,
+            self.topk,
+            self.speculative_num_draft_tokens,
+        )
 
     # --------------------------------------------------------
     #  BaseSpecWorker interface
@@ -432,10 +476,18 @@ class SpecBlockWorkerV2(BaseSpecWorker):
                 )
             return batch_output
 
-        # Path 2 + 3: decode (plus idle-as-decode passthrough)
+        # Path 2: a scheduler padding/dummy idle batch has no real request
+        # state.  In particular, a zero-row SpecBlockDraftInput cannot enter
+        # the draft CUDA graph (its active batch size must be positive).  Match
+        # the target worker's idle semantics and leave draft/verify/refresh
+        # untouched; there is no next-draft handoff to construct.
+        if model_worker_batch.forward_mode.is_idle():
+            return self._target_worker.forward_batch_generation(model_worker_batch)
+
+        # Path 3: decode. Preserve the legacy empty-input construction for a
+        # non-idle caller; normal V2 batches receive real state via
+        # next_draft_input from prefill or the preceding refresh.
         if model_worker_batch.spec_info is None:
-            # Idle decode — no draft state to consume.  Build minimal
-            # idle SpecBlockDraftInput.
             target_cfg = self._target_worker.model_runner.model.config
             draft_dtype = next(
                 self._draft_worker.draft_runner.model.parameters()
@@ -479,6 +531,63 @@ class SpecBlockWorkerV2(BaseSpecWorker):
     #  verify with plan_stream prepare overlap
     # --------------------------------------------------------
 
+    def _prepare_verify_forward_batch(
+        self,
+        batch: ModelWorkerBatch,
+        spec_info: SpecBlockVerifyInput,
+    ) -> Tuple[ForwardBatch, bool]:
+        """Prepare target verification metadata on the plan stream.
+
+        This is the SpecBlock counterpart of EAGLE's ``prepare_for_v2_verify``.
+        It deliberately stops before target execution: the caller orders the
+        plan stream against the draft stream, repairs draft-dependent graph
+        buffers, and only then launches the target forward on the main stream.
+        """
+        from sglang.srt.speculative.eagle_info_v2 import (
+            assign_extend_cache_locs_func,
+        )
+
+        if not batch.forward_mode.is_idle():
+            bs = len(batch.req_pool_indices)
+            batch.input_ids = spec_info.draft_token
+            batch.out_cache_loc = assign_extend_cache_locs_func(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                start_offset=batch.seq_lens,
+                end_offset=batch.seq_lens + spec_info.draft_token_num,
+                batch_size=bs,
+                draft_token_num=spec_info.draft_token_num,
+                device=batch.input_ids.device,
+            )
+
+        # Dynamic SpecBlock tree widths must be visible before the attention
+        # backend creates its target-verify metadata.
+        target_attn = self._target_worker.model_runner.attn_backend
+        if hasattr(target_attn, "num_draft_tokens"):
+            target_attn.num_draft_tokens = spec_info.draft_token_num
+
+        batch.forward_mode = (
+            ForwardMode.IDLE
+            if batch.forward_mode.is_idle()
+            else ForwardMode.TARGET_VERIFY
+        )
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch.return_hidden_states = False
+        verify_forward_batch = ForwardBatch.init_new(
+            batch, self._target_worker.model_runner
+        )
+
+        graph_runner = self._target_worker.model_runner.graph_runner
+        can_run_cuda_graph = bool(
+            graph_runner and graph_runner.can_run(verify_forward_batch)
+        )
+        if can_run_cuda_graph:
+            graph_runner.replay_prepare(verify_forward_batch)
+        elif not batch.forward_mode.is_idle():
+            target_attn.init_forward_metadata(verify_forward_batch)
+
+        return verify_forward_batch, can_run_cuda_graph
+
     def verify(self, batch: ModelWorkerBatch) -> GenerationBatchResult:
         """Run target verify on the draft tree.
 
@@ -491,28 +600,39 @@ class SpecBlockWorkerV2(BaseSpecWorker):
         is ~5ms on bs=4 — modest but real (bigger gains require P3 cuda
         graph capture).
         """
-        # V2 verify: V1's prepare_for_verify needs tree_cache (not on MWB).
-        # Replace with EAGLE V2's pattern (cf. eagle_info_v2.py:213
-        # prepare_for_v2_verify): manually set input_ids + carve
-        # out_cache_loc from req_to_token mapping using current seq_lens
-        # and draft_token_num.
         spec_info: SpecBlockVerifyInput = batch.spec_info  # type: ignore[assignment]
-        if isinstance(spec_info, SpecBlockVerifyInput) and not batch.forward_mode.is_idle():
-            from sglang.srt.speculative.eagle_info_v2 import (
-                assign_extend_cache_locs_func,
+        if not isinstance(spec_info, SpecBlockVerifyInput):
+            raise RuntimeError(
+                "SpecBlock V2 verification requires SpecBlockVerifyInput; "
+                f"got {type(spec_info).__name__}."
             )
-            bs = len(batch.req_pool_indices)
-            batch.input_ids = spec_info.draft_token
-            device = batch.input_ids.device
-            req_to_token_pool = self.req_to_token_pool
-            batch.out_cache_loc = assign_extend_cache_locs_func(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=req_to_token_pool.req_to_token,
-                start_offset=batch.seq_lens,
-                end_offset=batch.seq_lens + spec_info.draft_token_num,
-                batch_size=bs,
-                draft_token_num=spec_info.draft_token_num,
-                device=device,
+
+        # The draft tree is still executing on the main stream when Python
+        # reaches this point.  Build cache locations, ForwardBatch, and target
+        # attention metadata on plan_stream so that work overlaps the tail of
+        # tree construction rather than serializing behind it.
+        if self.plan_stream is not None:
+            batch.seq_lens.record_stream(
+                torch.get_device_module(self.device).current_stream()
+            )
+        with self.plan_stream_ctx:
+            verify_forward_batch, prepared_can_run_cuda_graph = (
+                self._prepare_verify_forward_batch(batch, spec_info)
+            )
+
+        # ``init_forward_metadata`` / graph replay preparation can read the
+        # tree topology before the draft stream has finished.  The EAGLE V2
+        # correction hook refreshes exactly those draft-dependent buffers after
+        # the GPU-only stream join, without repeating the whole plan stage.
+        if self.plan_stream is not None:
+            torch.get_device_module(self.device).current_stream().wait_stream(
+                self.plan_stream
+            )
+            graph_runner = self._target_worker.model_runner.graph_runner
+            target_attn = self._target_worker.model_runner.attn_backend
+            target_attn.update_verify_buffers_to_fill_after_draft(
+                spec_info,
+                graph_runner.bs if prepared_can_run_cuda_graph else None,
             )
 
         sb = _MWBAsScheduleBatch(
@@ -527,23 +647,24 @@ class SpecBlockWorkerV2(BaseSpecWorker):
             accept_length_cpu,
             can_run_cuda_graph,
         ) = self._draft_worker._v1._verify_and_accept(
-            sb, skip_prepare=True, skip_free_cache=True,
+            sb,
+            skip_prepare=True,
+            skip_free_cache=True,
+            prepared_forward_batch=verify_forward_batch,
+            prepared_can_run_cuda_graph=prepared_can_run_cuda_graph,
         )
-        # Stash the FILTERED verified_ids (length sum_i (accept_i + 1),
-        # the per-req accepted-chain tokens flat on GPU) so the V2
-        # _draft_extend_for_decode wrapper can feed it to V1's
-        # _refresh_draft_state.  V1 path expects this filtered shape;
-        # the unfiltered predict_flat we return as next_token_ids below
-        # is for the V2 scheduler's [bs*stride] schema and would cause
-        # _refresh_draft_state to read OOB tokens at non-accepted slots
-        # (→ embed_tokens(input_ids) CUDA assert on async kernel).
+        # Stash the filtered accepted chains so _draft_extend_for_decode can
+        # feed V1's refresh path. The same tensor is packed below for the V2
+        # scheduler; raw tree-node-indexed predict entries are not contiguous.
         self._last_verified_ids_filtered = verified_ids
         # NOTE: verify_done event must be recorded AFTER
         # _refresh_draft_state writes new b0_* (so plan-stream sees fresh
         # values). Done in _draft_extend_for_decode below.
         # Pre-create the event here so _draft_extend_for_decode can record.
         self._verify_done = (
-            torch.cuda.Event() if self.device == "cuda" else None
+            torch.get_device_module(self.device).Event()
+            if self.plan_stream is not None
+            else None
         )
 
         # V2 scheduler reads result.accept_lens (Tensor on cpu) to derive
@@ -551,24 +672,18 @@ class SpecBlockWorkerV2(BaseSpecWorker):
         # _v1 by _verify_and_accept above.
         accept_lens_t = self._draft_worker._v1._last_accept_lens_cpu
 
-        # V2 scheduler's _resolve_spec_overlap_token_ids expects
-        # next_token_ids to be a CPU Tensor of shape [bs * stride] where
-        # stride = speculative_num_draft_tokens.  It then slices per-req:
-        #   next_token_ids[i*stride : i*stride + accept_lens[i]]
-        # to get accepted tokens (with bonus).  V1 verified_id is filtered
-        # (sum_i accept+1, not bs*stride), so we pass the unfiltered
-        # spec_info.predict tensor instead.
-        bs = len(batch.req_pool_indices)
+        # The V2 scheduler slices one accepted path from each fixed-width row.
+        # ``spec_info.predict`` is tree-node-indexed and therefore contains
+        # gaps whenever the accepted path does not follow contiguous BFS nodes;
+        # exposing its raw prefix can commit stale tokens or a false EOS. Pack
+        # the already-filtered accepted chains into the scheduler contract.
         stride = self.speculative_num_draft_tokens
-        if isinstance(spec_info, SpecBlockVerifyInput) and spec_info.predict is not None:
-            # spec_info.predict shape is [bs * draft_token_num + 1] (the +1
-            # is a bonus slot reserved by verify_tree_greedy_func).  Slice
-            # to bs*stride and reshape if needed.
-            predict_flat = spec_info.predict[: bs * stride].to(
-                "cpu", non_blocking=True
-            ).to(torch.int64)
-        else:
-            predict_flat = verified_ids.to("cpu", non_blocking=True)
+        accept_lens_gpu = spec_info.accept_length + 1
+        predict_flat = _pack_verified_ids_for_scheduler(
+            verified_ids,
+            accept_lens_gpu,
+            stride,
+        ).to("cpu", non_blocking=True)
 
         return GenerationBatchResult(
             logits_output=logits_output,

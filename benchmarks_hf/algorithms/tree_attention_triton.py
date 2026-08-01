@@ -28,7 +28,6 @@ import triton
 import triton.language as tl
 
 _DUMMY_MASK = None
-_ATTENTION_BLOCK_N = 32 if "metax" in torch.__version__.lower() else 64
 
 
 @triton.jit
@@ -141,7 +140,7 @@ def tree_attention(q, k_full, v_full, cross_count, k_slots, scale):
 
     # Block sizes — BLOCK_M tuned for small-M decoding
     BLOCK_M = 16 if M <= 16 else 32
-    BLOCK_N = _ATTENTION_BLOCK_N
+    BLOCK_N = 64
 
     out = torch.empty_like(q)
 
@@ -157,6 +156,164 @@ def tree_attention(q, k_full, v_full, cross_count, k_slots, scale):
         K_SLOTS=k_slots,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
+        D=D,
+    )
+    return out
+
+
+@triton.jit
+def _ragged_tree_attn_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr, Lengths_ptr, ValidSlots_ptr, Out_ptr,
+    M, C, n_kv_groups,
+    stride_q_b, stride_q_h, stride_q_m, stride_q_d,
+    stride_k_b, stride_k_h, stride_k_c, stride_k_d,
+    stride_v_b, stride_v_h, stride_v_c, stride_v_d,
+    stride_o_b, stride_o_h, stride_o_m, stride_o_d,
+    scale: tl.constexpr,
+    K_SLOTS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Tree attention with a distinct cross length and valid query width per row."""
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_h = tl.program_id(2)
+    pid_kh = pid_h // n_kv_groups
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, D)
+    cross_count = tl.load(Lengths_ptr + pid_b)
+    valid_slots = tl.load(ValidSlots_ptr + pid_b)
+    total_valid = cross_count + valid_slots
+    query_valid = offs_m < valid_slots
+
+    q_base = Q_ptr + pid_b * stride_q_b + pid_h * stride_q_h
+    q = tl.load(
+        q_base + offs_m[:, None] * stride_q_m + offs_d[None, :] * stride_q_d,
+        mask=(offs_m[:, None] < M),
+        other=0.0,
+    )
+    q_pos = offs_m // K_SLOTS
+    q_slot = offs_m - q_pos * K_SLOTS
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+
+    k_base = K_ptr + pid_b * stride_k_b + pid_kh * stride_k_h
+    v_base = V_ptr + pid_b * stride_v_b + pid_kh * stride_v_h
+    for n_start in range(0, C, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        n_in_bounds = offs_n < C
+        row_kv_valid = n_in_bounds & (offs_n < total_valid)
+        k = tl.load(
+            k_base + offs_n[:, None] * stride_k_c + offs_d[None, :] * stride_k_d,
+            mask=row_kv_valid[:, None],
+            other=0.0,
+        )
+        v = tl.load(
+            v_base + offs_n[:, None] * stride_v_c + offs_d[None, :] * stride_v_d,
+            mask=row_kv_valid[:, None],
+            other=0.0,
+        )
+        qk = tl.dot(q, tl.trans(k)) * scale
+
+        is_cross = offs_n[None, :] < cross_count
+        current_index = offs_n - cross_count
+        current_pos = current_index // K_SLOTS
+        current_slot = current_index - current_pos * K_SLOTS
+        current_visible = (
+            (current_pos[None, :] < q_pos[:, None])
+            | (
+                (current_pos[None, :] == q_pos[:, None])
+                & (current_slot[None, :] <= q_slot[:, None])
+            )
+        )
+        normal_visible = (
+            (is_cross | current_visible)
+            & (offs_n[None, :] < total_valid)
+            & query_valid[:, None]
+        )
+        # Padded query rows are discarded, but keep their softmax finite so
+        # NaNs cannot flow through later residual/MLP layers.
+        padding_sentinel = (~query_valid[:, None]) & (offs_n[None, :] == 0)
+        visible = (normal_visible | padding_sentinel) & n_in_bounds[None, :]
+        qk = tl.where(visible, qk, -float("inf"))
+
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        acc += tl.dot(p.to(v.dtype), v)
+        m_i = m_i_new
+
+    acc = acc / l_i[:, None]
+    o_base = Out_ptr + pid_b * stride_o_b + pid_h * stride_o_h
+    tl.store(
+        o_base + offs_m[:, None] * stride_o_m + offs_d[None, :] * stride_o_d,
+        acc.to(Out_ptr.dtype.element_ty),
+        mask=(offs_m[:, None] < M),
+    )
+
+
+def ragged_tree_attention(
+    q,
+    cache_k,
+    cache_v,
+    lengths,
+    valid_slots,
+    max_total,
+    k_slots,
+    n_kv_groups,
+    scale,
+):
+    """Attend to row-wise ``[cross | current]`` GQA KV in a shared cache."""
+    if q.ndim != 4 or cache_k.ndim != 4 or cache_v.ndim != 4:
+        raise ValueError("ragged draft attention tensors must be rank 4")
+    B, H, M, D = q.shape
+    n_kv_groups = int(n_kv_groups)
+    if n_kv_groups <= 0 or H % n_kv_groups != 0:
+        raise ValueError("query heads must be divisible by n_kv_groups")
+    if cache_k.shape != cache_v.shape:
+        raise ValueError("ragged draft cache key/value shapes must match")
+    if cache_k.shape[0] != B or cache_k.shape[1] * int(n_kv_groups) != H:
+        raise ValueError("ragged draft cache batch/head shapes do not match query")
+    if cache_k.shape[3] != D:
+        raise ValueError("ragged draft cache head dimension does not match query")
+    if lengths.shape != valid_slots.shape or lengths.numel() != B:
+        raise ValueError("ragged draft metadata must have one entry per batch row")
+    if not lengths.is_contiguous() or not valid_slots.is_contiguous():
+        raise ValueError("ragged draft metadata must be contiguous")
+    if any(tensor.device != q.device for tensor in (cache_k, cache_v, lengths, valid_slots)):
+        raise ValueError("ragged draft attention tensors must share one device")
+    if q.dtype != cache_k.dtype or q.dtype != cache_v.dtype:
+        raise TypeError("ragged draft attention Q/K/V dtypes must match")
+    if lengths.dtype != torch.long or valid_slots.dtype != torch.long:
+        raise TypeError("ragged draft metadata must use torch.long")
+    if D != 128:
+        raise ValueError(f"kernel hardcoded for D=128, got {D}")
+    if q.device.type != "cuda":
+        raise ValueError("ragged draft attention requires CUDA tensors")
+    if max_total <= 0 or max_total > cache_k.shape[2]:
+        raise ValueError("ragged draft attention width is out of range")
+    block_m = 16 if M <= 16 else 32
+    block_n = 64
+    out = torch.empty_like(q)
+    grid = (triton.cdiv(M, block_m), B, H)
+    _ragged_tree_attn_fwd_kernel[grid](
+        q, cache_k, cache_v, lengths, valid_slots, out,
+        M, int(max_total), int(n_kv_groups),
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        cache_k.stride(0), cache_k.stride(1), cache_k.stride(2), cache_k.stride(3),
+        cache_v.stride(0), cache_v.stride(1), cache_v.stride(2), cache_v.stride(3),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        scale=scale,
+        K_SLOTS=k_slots,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
         D=D,
     )
     return out
@@ -324,7 +481,7 @@ def single_pos_attention(q, k_full, v_full, cross_count, ttt_count, ttt_mask,
         stride_ttt_c = 0
 
     BLOCK_M = 16 if M <= 16 else 32
-    BLOCK_N = _ATTENTION_BLOCK_N
+    BLOCK_N = 64
     grid = (B, H)
     _single_pos_attn_fwd_kernel[grid](
         q, k_full, v_full, ttt_mask_bool, out,
@@ -359,8 +516,8 @@ def single_pos_attention(q, k_full, v_full, cross_count, ttt_count, ttt_mask,
 #   * cross_k stride[0] is 0 (broadcast view) -> all batches read same buffer
 #   * ttt_k is GQA-non-expanded [B, KH, T_ttt, D]; kernel uses pid_h //
 #     n_kv_groups to index KV head (no repeat_kv needed)
-#   * curr_k is post-repeat_kv [B, H, K, D] (caller still expands current
-#     for cross_cache write coherency; could remove later)
+#   * cross_k may be either Hq-expanded legacy storage or Hkv-native ragged storage
+#   * curr_k is GQA-native [B, KH, K, D], indexed like ttt_k
 #
 # 3 inner loops (cross / ttt / curr) carry online-softmax state (m_i, l_i,
 # acc) across boundaries, mathematically identical to the all-cat single-loop
@@ -389,6 +546,7 @@ def _three_part_attn_fwd_kernel(
     scale: tl.constexpr,
     K_SLOTS: tl.constexpr,
     BLOCK_M: tl.constexpr,         # padded to >=16 for tl.dot portability
+    CROSS_GQA: tl.constexpr,
     HAS_TTT: tl.constexpr,
     BLOCK_N: tl.constexpr,
     D: tl.constexpr,
@@ -396,9 +554,9 @@ def _three_part_attn_fwd_kernel(
     """3-buffer attention. Grid: (B, H).
 
     Region layout (along KV axis):
-      cross [0, cross_count)        - all visible, GQA-expanded source
-      ttt   [0, ttt_count)          - per-mask visible, GQA-non-expanded
-      curr  [0, K_SLOTS)            - causal within slots, GQA-expanded
+      cross [0, cross_count)        - all visible, Hq-expanded or Hkv-native
+      ttt   [0, ttt_count)          - per-mask visible, Hkv-native
+      curr  [0, K_SLOTS)            - causal within slots, Hkv-native
 
     Online softmax state carried across all 3 loops.
     """
@@ -423,9 +581,10 @@ def _three_part_attn_fwd_kernel(
     acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
 
     # ---- Loop 1: cross region (all visible) ----
-    # cross_k stride_ck_b may be 0 (broadcast view) -> identical pointer for all batches.
-    ck_base = CROSS_K_ptr + pid_b * stride_ck_b + pid_h * stride_ck_h
-    cv_base = CROSS_V_ptr + pid_b * stride_cv_b + pid_h * stride_cv_h
+    # cross_k may be batch-broadcast and either Hq-expanded or Hkv-native.
+    cross_head = pid_kh if CROSS_GQA else pid_h
+    ck_base = CROSS_K_ptr + pid_b * stride_ck_b + cross_head * stride_ck_h
+    cv_base = CROSS_V_ptr + pid_b * stride_cv_b + cross_head * stride_cv_h
     for n_start in range(0, cross_count, BLOCK_N):
         offs_n = n_start + tl.arange(0, BLOCK_N)
         n_in_bounds = offs_n < cross_count
@@ -518,11 +677,11 @@ def _three_part_attn_fwd_kernel(
 
 def three_part_attention(
     q: torch.Tensor,                       # [B, H, K, D]
-    cross_k: torch.Tensor,                 # [B, H, T_cross, D] (stride[0] may be 0)
+    cross_k: torch.Tensor,                 # [B, H|KH, T_cross, D] (stride[0] may be 0)
     cross_v: torch.Tensor,
     ttt_k: torch.Tensor,                   # [B, KH, T_ttt, D] (GQA non-expanded), or None
     ttt_v: torch.Tensor,
-    curr_k: torch.Tensor,                  # [B, H, K, D] (post repeat_kv)
+    curr_k: torch.Tensor,                  # [B, KH, K, D] (GQA non-expanded)
     curr_v: torch.Tensor,
     cross_count: int,
     ttt_count: int,
@@ -533,15 +692,53 @@ def three_part_attention(
 ) -> torch.Tensor:
     """3-buffer attention without cat. Returns out [B, H, K, D].
 
-    cross_k may be a `.expand(B, ...)` view with stride[0]==0; the kernel
-    reads broadcast-correctly via stride.
-    ttt_k is GQA-non-expanded; kernel does GQA index via pid_h // n_kv_groups.
+    cross_k may be a `.expand(B, ...)` view with stride[0]==0 and may
+    store either Hq-expanded or Hkv-native heads. TTT/current KV stay
+    GQA-native and are indexed via ``pid_h // n_kv_groups``.
     """
     B, H, M, D = q.shape
-    assert M == k_slots
-    assert D == 128
+    n_kv_groups = int(n_kv_groups)
+    if n_kv_groups <= 0 or H % n_kv_groups != 0:
+        raise ValueError("query heads must be divisible by n_kv_groups")
+    if M != k_slots or D != 128:
+        raise ValueError("three-part attention expects K query slots with D=128")
+    if cross_k.shape != cross_v.shape or curr_k.shape != curr_v.shape:
+        raise ValueError("three-part attention key/value shapes must match")
+    if cross_k.ndim != 4 or curr_k.ndim != 4:
+        raise ValueError("three-part attention KV tensors must be rank 4")
+    if cross_k.shape[0] != B or curr_k.shape[0] != B:
+        raise ValueError("three-part attention batch dimensions must match query")
+    if cross_k.shape[3] != D or curr_k.shape[3] != D:
+        raise ValueError("three-part attention head dimensions must match query")
+    kv_heads = H // int(n_kv_groups)
+    cross_gqa = cross_k.shape[1] == kv_heads
+    if not cross_gqa and cross_k.shape[1] != H:
+        raise ValueError("cross cache must use either Hq or Hkv heads")
+    if curr_k.shape[1] != kv_heads:
+        raise ValueError("current KV must use Hkv heads")
+    if not 0 <= int(cross_count) <= cross_k.shape[2]:
+        raise ValueError("cross_count exceeds cross-cache width")
+    if curr_k.shape[2] < k_slots:
+        raise ValueError("current KV width is smaller than K slots")
+    if any(tensor.device != q.device for tensor in (cross_k, cross_v, curr_k, curr_v)):
+        raise ValueError("three-part attention tensors must share one device")
+    if any(tensor.dtype != q.dtype for tensor in (cross_k, cross_v, curr_k, curr_v)):
+        raise TypeError("three-part attention Q/K/V dtypes must match")
 
     has_ttt = (ttt_count > 0) and (ttt_mask is not None) and (ttt_k is not None)
+    if has_ttt:
+        if ttt_v is None or ttt_k.shape != ttt_v.shape:
+            raise ValueError("TTT key/value shapes must match")
+        if ttt_k.ndim != 4 or ttt_k.shape[0] != B or ttt_k.shape[1] != kv_heads:
+            raise ValueError("TTT KV must use matching batch and Hkv heads")
+        if not 0 <= int(ttt_count) <= ttt_k.shape[2]:
+            raise ValueError("ttt_count exceeds TTT-cache width")
+        if any(tensor.device != q.device for tensor in (ttt_k, ttt_v)):
+            raise ValueError("TTT KV must share the query device")
+        if any(tensor.dtype != q.dtype for tensor in (ttt_k, ttt_v)):
+            raise TypeError("TTT KV dtype must match query")
+        if ttt_k.shape[3] != D:
+            raise ValueError("TTT KV head dimension must match query")
 
     out = torch.empty_like(q)
 
@@ -570,7 +767,7 @@ def three_part_attention(
         tv_strides = (ttt_v.stride(0), ttt_v.stride(1), ttt_v.stride(2), ttt_v.stride(3))
 
     BLOCK_M = 16 if M <= 16 else 32
-    BLOCK_N = _ATTENTION_BLOCK_N
+    BLOCK_N = 64
     grid = (B, H)
     _three_part_attn_fwd_kernel[grid](
         q,
@@ -591,9 +788,243 @@ def three_part_attention(
         scale=scale,
         K_SLOTS=k_slots,
         BLOCK_M=BLOCK_M,
+        CROSS_GQA=cross_gqa,
         HAS_TTT=has_ttt,
         BLOCK_N=BLOCK_N,
         D=D,
+    )
+    return out
+
+
+@triton.jit
+def _ragged_three_part_attn_fwd_kernel(
+    Q_ptr,
+    CROSS_K_ptr, CROSS_V_ptr,
+    TTT_K_ptr, TTT_V_ptr,
+    CURR_K_ptr, CURR_V_ptr,
+    CROSS_LENGTHS_ptr, LEAF_OWNER_ptr,
+    TTT_MASK_ptr, Out_ptr,
+    max_cross_count,
+    num_requests,
+    ttt_count,
+    n_kv_groups,
+    stride_q_b, stride_q_h, stride_q_m, stride_q_d,
+    stride_ck_b, stride_ck_h, stride_ck_t, stride_ck_d,
+    stride_cv_b, stride_cv_h, stride_cv_t, stride_cv_d,
+    stride_tk_b, stride_tk_h, stride_tk_t, stride_tk_d,
+    stride_tv_b, stride_tv_h, stride_tv_t, stride_tv_d,
+    stride_qk_b, stride_qk_h, stride_qk_t, stride_qk_d,
+    stride_qv_b, stride_qv_h, stride_qv_t, stride_qv_d,
+    stride_mb, stride_mc,
+    stride_o_b, stride_o_h, stride_o_m, stride_o_d,
+    scale: tl.constexpr,
+    K_SLOTS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    D: tl.constexpr,
+):
+    """Owner-indexed 3-buffer attention for heterogeneous pending leaves."""
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_kh = pid_h // n_kv_groups
+    owner_raw = tl.load(LEAF_OWNER_ptr + pid_b)
+    owner = tl.maximum(tl.minimum(owner_raw, num_requests - 1), 0)
+    cross_count = tl.load(CROSS_LENGTHS_ptr + owner)
+
+    offs_m = tl.arange(0, BLOCK_M)
+    m_in_bounds = offs_m < K_SLOTS
+    offs_d = tl.arange(0, D)
+    q_base = Q_ptr + pid_b * stride_q_b + pid_h * stride_q_h
+    q = tl.load(
+        q_base + offs_m[:, None] * stride_q_m + offs_d[None, :] * stride_q_d,
+        mask=m_in_bounds[:, None],
+        other=0.0,
+    )
+
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, D], dtype=tl.float32)
+
+    ck_base = CROSS_K_ptr + owner * stride_ck_b + pid_kh * stride_ck_h
+    cv_base = CROSS_V_ptr + owner * stride_cv_b + pid_kh * stride_cv_h
+    for n_start in range(0, max_cross_count, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        n_in_bounds = offs_n < cross_count
+        k = tl.load(
+            ck_base + offs_n[:, None] * stride_ck_t + offs_d[None, :] * stride_ck_d,
+            mask=n_in_bounds[:, None],
+            other=0.0,
+        )
+        v = tl.load(
+            cv_base + offs_n[:, None] * stride_cv_t + offs_d[None, :] * stride_cv_d,
+            mask=n_in_bounds[:, None],
+            other=0.0,
+        )
+        qk = tl.dot(q, tl.trans(k)) * scale
+        qk = tl.where(n_in_bounds[None, :], qk, -float("inf"))
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        acc += tl.dot(p.to(v.dtype), v)
+        m_i = m_i_new
+
+    tk_base = TTT_K_ptr + owner * stride_tk_b + pid_kh * stride_tk_h
+    tv_base = TTT_V_ptr + owner * stride_tv_b + pid_kh * stride_tv_h
+    mask_base = TTT_MASK_ptr + pid_b * stride_mb
+    for n_start in range(0, ttt_count, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        n_in_bounds = offs_n < ttt_count
+        k = tl.load(
+            tk_base + offs_n[:, None] * stride_tk_t + offs_d[None, :] * stride_tk_d,
+            mask=n_in_bounds[:, None],
+            other=0.0,
+        )
+        v = tl.load(
+            tv_base + offs_n[:, None] * stride_tv_t + offs_d[None, :] * stride_tv_d,
+            mask=n_in_bounds[:, None],
+            other=0.0,
+        )
+        qk = tl.dot(q, tl.trans(k)) * scale
+        ttt_vis = tl.load(
+            mask_base + offs_n * stride_mc,
+            mask=n_in_bounds,
+            other=0,
+        ).to(tl.int1)
+        qk = tl.where(ttt_vis[None, :] & n_in_bounds[None, :], qk, -float("inf"))
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        acc += tl.dot(p.to(v.dtype), v)
+        m_i = m_i_new
+
+    qk_base = CURR_K_ptr + pid_b * stride_qk_b + pid_kh * stride_qk_h
+    qv_base = CURR_V_ptr + pid_b * stride_qv_b + pid_kh * stride_qv_h
+    for n_start in range(0, K_SLOTS, BLOCK_N):
+        offs_n = n_start + tl.arange(0, BLOCK_N)
+        n_in_bounds = offs_n < K_SLOTS
+        k = tl.load(
+            qk_base + offs_n[:, None] * stride_qk_t + offs_d[None, :] * stride_qk_d,
+            mask=n_in_bounds[:, None],
+            other=0.0,
+        )
+        v = tl.load(
+            qv_base + offs_n[:, None] * stride_qv_t + offs_d[None, :] * stride_qv_d,
+            mask=n_in_bounds[:, None],
+            other=0.0,
+        )
+        qk = tl.dot(q, tl.trans(k)) * scale
+        causal_vis = (offs_n[None, :] <= offs_m[:, None]) & n_in_bounds[None, :]
+        qk = tl.where(causal_vis, qk, -float("inf"))
+        m_ij = tl.max(qk, axis=1)
+        m_i_new = tl.maximum(m_i, m_ij)
+        alpha = tl.exp(m_i - m_i_new)
+        p = tl.exp(qk - m_i_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        acc += tl.dot(p.to(v.dtype), v)
+        m_i = m_i_new
+
+    acc = acc / l_i[:, None]
+    o_base = Out_ptr + pid_b * stride_o_b + pid_h * stride_o_h
+    tl.store(
+        o_base + offs_m[:, None] * stride_o_m + offs_d[None, :] * stride_o_d,
+        acc.to(Out_ptr.dtype.element_ty),
+        mask=m_in_bounds[:, None],
+    )
+
+
+def ragged_three_part_attention(
+    q: torch.Tensor,
+    cross_k: torch.Tensor,
+    cross_v: torch.Tensor,
+    cross_lengths: torch.Tensor,
+    leaf_owner: torch.Tensor,
+    ttt_k: torch.Tensor,
+    ttt_v: torch.Tensor,
+    ttt_mask: torch.Tensor,
+    curr_k: torch.Tensor,
+    curr_v: torch.Tensor,
+    max_cross_count: int,
+    k_slots: int,
+    n_kv_groups: int,
+    scale: float,
+) -> torch.Tensor:
+    """Attend flat leaves to request-owned ``cross -> TTT -> current`` KV."""
+    if q.ndim != 4 or cross_k.ndim != 4 or ttt_k.ndim != 4 or curr_k.ndim != 4:
+        raise ValueError("ragged three-part attention tensors must be rank 4")
+    leaves, heads, query_slots, head_dim = q.shape
+    n_kv_groups = int(n_kv_groups)
+    if n_kv_groups <= 0 or heads % n_kv_groups != 0:
+        raise ValueError("query heads must be divisible by n_kv_groups")
+    kv_heads = heads // n_kv_groups
+    if query_slots != int(k_slots) or head_dim != 128:
+        raise ValueError("ragged three-part attention expects K query slots with D=128")
+    if cross_k.shape != cross_v.shape or ttt_k.shape != ttt_v.shape:
+        raise ValueError("request-owned key/value shapes must match")
+    if curr_k.shape != curr_v.shape:
+        raise ValueError("current key/value shapes must match")
+    requests = cross_k.shape[0]
+    if cross_k.shape[1] != kv_heads or ttt_k.shape[1] != kv_heads:
+        raise ValueError("cross and TTT KV must use Hkv heads")
+    if cross_k.shape[3] != head_dim:
+        raise ValueError("cross KV head dimension must match query")
+    if ttt_k.shape[0] != requests or ttt_k.shape[3] != head_dim:
+        raise ValueError("TTT KV must have one row per request")
+    if curr_k.shape[:2] != (leaves, kv_heads) or curr_k.shape[3] != head_dim:
+        raise ValueError("current KV must have one Hkv row per leaf")
+    if curr_k.shape[2] < int(k_slots):
+        raise ValueError("current KV width is smaller than K slots")
+    if ttt_mask.shape != (leaves, ttt_k.shape[2]):
+        raise ValueError("TTT mask must have one row per leaf and one column per TTT slot")
+    if cross_lengths.shape != (requests,) or leaf_owner.shape != (leaves,):
+        raise ValueError("ragged block-2 metadata shapes do not match requests/leaves")
+    if cross_lengths.dtype != torch.long or leaf_owner.dtype != torch.long:
+        raise TypeError("ragged block-2 metadata must use torch.long")
+    if not cross_lengths.is_contiguous() or not leaf_owner.is_contiguous():
+        raise ValueError("ragged block-2 metadata must be contiguous")
+    tensors = (
+        q, cross_k, cross_v, ttt_k, ttt_v, ttt_mask,
+        curr_k, curr_v, cross_lengths, leaf_owner,
+    )
+    if q.device.type != "cuda" or any(tensor.device != q.device for tensor in tensors):
+        raise ValueError("ragged three-part tensors must share one CUDA device")
+    if any(tensor.dtype != q.dtype for tensor in (cross_k, cross_v, ttt_k, ttt_v, curr_k, curr_v)):
+        raise TypeError("ragged three-part Q/K/V dtypes must match")
+    if not 0 < int(max_cross_count) <= cross_k.shape[2]:
+        raise ValueError("max_cross_count is outside cross-cache capacity")
+
+    ttt_mask_bool = ttt_mask if ttt_mask.dtype == torch.bool else ttt_mask.bool()
+    out = torch.empty_like(q)
+    block_m = 16 if query_slots <= 16 else 32
+    block_n = 64
+    _ragged_three_part_attn_fwd_kernel[(leaves, heads)](
+        q,
+        cross_k, cross_v,
+        ttt_k, ttt_v,
+        curr_k, curr_v,
+        cross_lengths, leaf_owner,
+        ttt_mask_bool, out,
+        int(max_cross_count), requests, ttt_k.shape[2], n_kv_groups,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        cross_k.stride(0), cross_k.stride(1), cross_k.stride(2), cross_k.stride(3),
+        cross_v.stride(0), cross_v.stride(1), cross_v.stride(2), cross_v.stride(3),
+        ttt_k.stride(0), ttt_k.stride(1), ttt_k.stride(2), ttt_k.stride(3),
+        ttt_v.stride(0), ttt_v.stride(1), ttt_v.stride(2), ttt_v.stride(3),
+        curr_k.stride(0), curr_k.stride(1), curr_k.stride(2), curr_k.stride(3),
+        curr_v.stride(0), curr_v.stride(1), curr_v.stride(2), curr_v.stride(3),
+        ttt_mask_bool.stride(0), ttt_mask_bool.stride(1),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        scale=scale,
+        K_SLOTS=int(k_slots),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        D=head_dim,
     )
     return out
 
@@ -715,7 +1146,7 @@ def tree_attention_gqa(q, k, v, cross_count, k_slots, scale):
     group_size = Hq // Hkv
 
     BLOCK_M = 16 if M <= 16 else 32
-    BLOCK_N = _ATTENTION_BLOCK_N
+    BLOCK_N = 64
 
     out = torch.empty_like(q)
 

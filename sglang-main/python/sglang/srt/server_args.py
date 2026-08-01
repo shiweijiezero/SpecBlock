@@ -664,6 +664,8 @@ class ServerArgs:
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
+        if self.speculative_algorithm is not None:
+            self.speculative_algorithm = self.speculative_algorithm.upper()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -1589,6 +1591,28 @@ class ServerArgs:
         model_config = self.get_model_config()
         use_mla_backend = self.use_mla_backend()
 
+        if self.speculative_algorithm == "SPECBLOCK_SHIFT":
+            explicit_backends = {
+                name: backend
+                for name, backend in (
+                    ("attention", self.attention_backend),
+                    ("prefill", self.prefill_attention_backend),
+                    ("decode", self.decode_attention_backend),
+                )
+                if backend is not None
+            }
+            unsupported = {
+                name: backend
+                for name, backend in explicit_backends.items()
+                if backend != "triton"
+            }
+            if unsupported:
+                raise ValueError(
+                    "SPECBLOCK_SHIFT requires Triton attention for native indexed "
+                    f"tree verification, but received {unsupported}."
+                )
+            self.attention_backend = "triton"
+
         if self.prefill_attention_backend is not None and (
             self.prefill_attention_backend == self.decode_attention_backend
         ):  # override the default attention backend
@@ -2105,12 +2129,13 @@ class ServerArgs:
                     "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
                 )
                 if (
-                    self.speculative_eagle_topk is not None
+                    self.speculative_algorithm != "SPECBLOCK_SHIFT"
+                    and self.speculative_eagle_topk is not None
                     and self.speculative_eagle_topk > 1
-                    and self.speculative_algorithm != "SPECBLOCK_SHIFT"
                 ):
                     raise ValueError(
-                        "Spec v2 currently only supports topk = 1 for speculative decoding."
+                        "Spec v2 currently only supports topk = 1 for "
+                        "EAGLE-style speculative decoding."
                     )
             else:
                 self.disable_overlap_schedule = True
@@ -5343,6 +5368,8 @@ def auto_choose_speculative_params(self: ServerArgs):
     if self.speculative_algorithm == "STANDALONE":
         # The default value for standalone speculative decoding
         return (3, 1, 4)
+    if self.speculative_algorithm == "SPECBLOCK_SHIFT":
+        return (2, 10, 90)
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)

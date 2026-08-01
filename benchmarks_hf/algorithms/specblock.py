@@ -1,5 +1,7 @@
-"""SpecBlock: Multi-block TTT with rank-guided tree speculative decoding,
-plus cross-slot hidden injection between decoder layers (shift).
+"""SpecBlock Shift: SpecBlock with cross-slot hidden injection between decoder layers.
+
+与 SpecBlock 完全相同的推理流程（tree construction, verification, accept），
+draft model 使用带 shift_proj 层的 SpecBlockInferenceModel。
 """
 
 import os
@@ -9,15 +11,16 @@ from ._specblock_base import _SpecBlockAlgorithmBase
 
 
 class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
-    """SpecBlock with shift_proj between decoder layers.
+    """SpecBlock Shift: SpecBlock with shift_proj between decoder layers.
 
     Inherits all tree construction, verification, and generation logic from
-    the internal base. Overrides load_model() to use the shift inference model.
+    _SpecBlockAlgorithmBase. Only overrides load_model() to use the shift inference model.
     """
 
-    # Recommended runtime config. Env vars here default-on so CLI / UI / offline
-    # eval get the recommended setup out-of-the-box without any export.
-    # Users can still override via explicit `export VAR=...` before launching.
+    # Day 22 Pareto config — 8-bench unified avg 104.96 tp, humaneval 133.27
+    # 超 Eagle3 官方 130.72 (+1.9%). Env vars here default-on so CLI/UI/offline
+    # eval gets the best config out-of-box without any export. Users can still
+    # override via explicit `export VAR=...` before launching.
     _PARETO_DEFAULTS = {
         # Draft kernel / tree build
         'DRAFT_COMPILE':            '2',         # torch.compile draft (mode='default') → draft 11→7.4ms
@@ -26,12 +29,13 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         'TREE_BUILD_TRITON':        '1',         # triton mega tree build
         'TREE_FINALIZE_CUDA':       '1',         # GPU-resident finalize
         'BFS_EVENTS':               '0',         # skip per-block CUDA event (省 launch)
+        'TARGET_ATTN_IMPL':         'sdpa',       # high-throughput target attention
         # Slot branching / topk
         'ADAPTIVE_SLOT0':           '1',         # p-based slot-0 branching
         'ADAPTIVE_ALL':             '1',         # p-based all-slot branching
         'SLOT_TOPK_MODE':           'slim_r2',   # [2,4,6,4] — slim rank-2 topk
         'STREAM_COMPACT_PROMPT':    '0',         # compact off (acc drops otherwise)
-        # Unified runtime controls
+        # Day 21/22 unified controls
         'SPECBLOCK_INTERNAL_PREWARM':'1',        # 2-shape internal prewarm (default on, +30-45s load)
         'SPECBLOCK_DYNAMIC_TREE':   '0',         # prompt-length dynamic tree_tokens (default off, -0.8% avg when on)
     }
@@ -44,12 +48,13 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         super().__init__(*args, **kwargs)
 
     def load_model(self):
-        """Load target model and SpecBlock draft model."""
+        """Load target model and SpecBlock Shift draft model."""
         # Load target model (reuse parent logic for everything except draft model import)
         from .specblock_inference_model import SpecBlockInferenceModel
         from safetensors.torch import load_file
         from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 
+        self._assert_target_runtime_environment()
         print(f"Loading target model from {self.model_path}...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -73,6 +78,7 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         self.target_model = AutoModelForCausalLM.from_pretrained(
             self.model_path, **_load_kwargs
         )
+        self._assert_target_runtime_contract(self.target_model)
         self.target_model.eval()
 
         num_layers = self.target_model.config.num_hidden_layers
@@ -84,7 +90,7 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         ]
         print(f"  Hidden layer indices: {self.hidden_layer_indices}")
 
-        print(f"Loading SpecBlock draft model from {self.draft_model_path}...")
+        print(f"Loading SpecBlock Shift draft model from {self.draft_model_path}...")
         config = AutoConfig.from_pretrained(self.draft_model_path, trust_remote_code=True)
         config.diffspec_draft_token_num = self.K
 
@@ -119,12 +125,25 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
             _compile_kwargs = dict(dynamic=True)
             if _compile_mode == '1':
                 _compile_kwargs['mode'] = 'reduce-overhead'
-            # Opt out via SPECBLOCK_ADAPT_DISABLE_COMPILE=1 for debug.
+            # Compiling the inference copy preserves parameter identity while
+            # avoiding retracing across repeated decoding iterations.
             self.draft_model.forward_with_cache = torch.compile(
                 self.draft_model.forward_with_cache, **_compile_kwargs,
             )
             self.draft_model.update_cache_and_draft = torch.compile(
                 self.draft_model.update_cache_and_draft, **_compile_kwargs,
+            )
+            # Keep the request-batched ragged path eager: active B and padded N
+            # vary enough to trigger expensive mid-run recompiles.  B=1 has a
+            # stable batch dimension and retains the compiled fast path.
+            self.draft_model.update_cache_and_draft_ragged_b1 = torch.compile(
+                self.draft_model.update_cache_and_draft_ragged, **_compile_kwargs,
+            )
+            self.draft_model.update_cache_and_draft_ragged_from_condition_b1 = (
+                torch.compile(
+                    self.draft_model.update_cache_and_draft_ragged_from_condition,
+                    **_compile_kwargs,
+                )
             )
 
         # Vocab mapping
@@ -152,7 +171,10 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         # Static-shape, sync-free draft tree builder (opt-in via SPECBLOCK_STATIC=1).
         # Must be initialized BEFORE _internal_prewarm() because prewarm calls
         # _generate_once which dispatches via _use_static_draft.
-        self._use_static_draft = os.environ.get("SPECBLOCK_STATIC", "0") == "1"
+        self._use_static_draft = (
+            not self._strict_linear
+            and os.environ.get("SPECBLOCK_STATIC", "0") == "1"
+        )
         if self._use_static_draft:
             try:
                 from .specblock_static_draft import StaticDraftBuilder
@@ -180,13 +202,15 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
                 self._use_static_draft = False
                 self._static_draft = None
 
-        # Internal prewarm: run short + mid prompt dummy generations to warm
-        # torch.compile cache for common prompt shapes. Disable via
+        # 2-shape internal prewarm (Day 22): run short + mid prompt dummy
+        # generations to warm torch.compile cache for common bench prompt shapes.
+        # Replaces the older `--benchmark-list hu:3 <target>` CLI prewarm hack
+        # and the now-removed DRAFT_WARMUP opt-in modes. Disable via
         # SPECBLOCK_INTERNAL_PREWARM=0.
         if os.environ.get('SPECBLOCK_INTERNAL_PREWARM', '1') == '1':
             self._internal_prewarm()
 
-        print(f"SpecBlock ready! K={self.K}, max_blocks={self.max_blocks}, "
+        print(f"SpecBlock Shift ready! K={self.K}, max_blocks={self.max_blocks}, "
               f"total_tokens={self.total_tokens}")
 
     def _internal_prewarm(self):
@@ -199,9 +223,8 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         a benchmark pays autotune cost (50-200ms each), inflating draft
         latency on small samples.
 
-        A shorter prewarm (a couple of dummy prompts) leaves draft latency
-        on small samples noticeably higher than steady-state truth, so the
-        full 5-prompt cover is preferred by default.
+        Empirical: short variant (2 prompts × 50 tokens, ~16s) leaves
+        humaneval:10 sanity at draft=19.7ms vs n=80 truth 7.7ms (2.5×).
 
         Total cost: ~80-120s at load time. Opt out via SPECBLOCK_INTERNAL_PREWARM=0.
         SPECBLOCK_PREWARM_LITE=1 falls back to the old 2-prompt × 50-token form.
@@ -226,7 +249,7 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
             #   ~5 distinct shape ranges, hits Triton autotune cache.
             # ultra-short bucket added for UI / chat use where prompt may be
             # 1-5 tokens ("hi", "hello") — without it first generation pays
-            # ~15s/iter compile cost.
+            # ~15s/iter compile cost (see Day 26 UI regression).
             dummy_msgs = [
                 # ~1-token ultra-short (UI chat-style)
                 [{"role": "user", "content": "hi"}],
@@ -285,15 +308,42 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
             print(f"  [INTERNAL_PREWARM] total {time.perf_counter() - _t0:.1f}s")
         except Exception as _e:
             print(f"  [INTERNAL_PREWARM] skipped: {type(_e).__name__}: {_e}")
+        finally:
+            self.reset_after_warmup()
 
-    # Prompt-length dynamic tree_tokens (opt-in via SPECBLOCK_DYNAMIC_TREE=1).
-    # Short prompt → small tree (save draft/target overhead);
-    # long prompt → large tree (amortize per-iter overhead). Off by default
-    # because static tree_tokens performs slightly better on average.
-    # Env knobs:
+    # Day 22: prompt-length dynamic tree_tokens (opt-in, OFF by default).
+    #
+    # Hypothesis: short prompt → small tree (save draft/target overhead);
+    # long prompt → large tree (amortize per-iter overhead).
+    #
+    # Empirical (threshold=150 @ 8-bench parallel): avg 104.14 vs static
+    # tree=90 104.96 = -0.8%. Wins on humaneval (+1.6%) and mtbench_short_turns,
+    # but mtbench long multi-turn samples, alpaca, nq_rag regress 3-5%.
+    # Gsm8k (long prompt, high acc) and nq_rag (long prompt, low acc) can't be
+    # distinguished by prompt length alone, which caps this heuristic.
+    #
+    # Kept as opt-in via SPECBLOCK_DYNAMIC_TREE=1. Env knobs:
     #   SPECBLOCK_DYNAMIC_TREE=0          (default off — static tree_tokens)
     #   SPECBLOCK_DYNAMIC_TREE_THRESHOLD=150
     #   SPECBLOCK_DYNAMIC_TREE_SMALL=50
+    def _chat_template_kwargs(self):
+        if os.environ.get("QWEN_NO_THINK", "0") == "1":
+            return {"enable_thinking": False}
+        return {}
+
+    def _batch_tree_budget_for_prompt(self, prompt_len: int) -> int:
+        budget = int(self.total_tokens)
+        if os.environ.get('SPECBLOCK_DYNAMIC_TREE', '0') != '1':
+            return budget
+        if getattr(self, '_use_static_draft', False):
+            raise NotImplementedError(
+                "SPECBLOCK_DYNAMIC_TREE is incompatible with the fixed-budget "
+                "StaticDraftBuilder in true-batch mode"
+            )
+        threshold = int(os.environ.get('SPECBLOCK_DYNAMIC_TREE_THRESHOLD', '150'))
+        small = int(os.environ.get('SPECBLOCK_DYNAMIC_TREE_SMALL', '50'))
+        return small if prompt_len <= threshold and small < budget else budget
+
     def _generate_once(self, conversation, max_new_tokens, temperature, **kwargs):
         if os.environ.get('SPECBLOCK_DYNAMIC_TREE', '0') != '1':
             return super()._generate_once(

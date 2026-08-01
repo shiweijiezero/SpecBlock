@@ -438,6 +438,19 @@ def crop_cache(past_key_values, target_length: int):
     )
 
 
+def _clone_static_tree_result(result):
+    """Detach StaticDraftBuilder outputs from its persistent reusable buffers."""
+    return (
+        result[0].clone(),
+        result[1].clone(),
+        result[2].clone(),
+        result[3].clone(),
+        list(result[4]),
+        list(result[5]),
+        list(result[6]),
+    )
+
+
 # ============================================================
 #              SpecBlock Algorithm
 # ============================================================
@@ -449,6 +462,8 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
     - max_blocks: maximum TTT blocks (0 = use config.json default)
     - total_tokens: tree budget after pruning (e.g., 60)
     """
+
+    supports_true_batch = False
 
     def __init__(
         self,
@@ -463,13 +478,21 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         tree_K_bfs: int = None,     # Effective K for block 2+ BFS (None = use tree_K)
         diverse_beam: bool = False, # Diversity-aware beam selection
         slot_topk_mode: str = None, # Override RANK_SLOT_TOPK: 'no_giveup', 'generous', 'uniform', 'flat10'
+        strict_linear: bool = False, # Explicit no-branching ablation; preserve one full greedy chain
         draft_quantize: str = None, # None, "int8", or "int4"
         **kwargs
     ):
         super().__init__(model_path, draft_model_path, device, **kwargs)
+        # Only the two concrete base algorithms own this batch core.  Adaptation
+        # subclasses override scalar hooks and must not silently inherit batching.
+        self.supports_true_batch = (
+            type(self).__name__ == "SpecBlockAlgorithm"
+            and type(self).__module__.rsplit(".", 1)[-1] == "specblock"
+        )
         self.draft_quantize = draft_quantize
         self.total_tokens = total_tokens if total_tokens is not None else draft_tokens
         self.beam_width = beam_width
+        self._strict_linear = bool(strict_linear)
         # Static-shape draft path attrs (filled by load_model when SPECBLOCK_STATIC=1).
         # Always initialize here so the dispatch check in
         # _build_tree_from_block1_dispatch / _build_draft_tree never AttributeError's,
@@ -609,6 +632,45 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
 
         # Command-line overrides config defaults
         self.max_blocks = max_blocks if max_blocks is not None else config_max_blocks
+        if self._strict_linear:
+            # A strict path is one root-to-leaf greedy continuation with no siblings.
+            # Rank predictions remain available for diagnostics but cannot truncate or
+            # widen the path. Disable every adaptive/tree mode that could alter shape.
+            self.beam_width = 1
+            self.RANK_SLOT_TOPK = [1] * self.rank_classes
+            self._bfs_slot_topk = None
+            self._adaptive_budget = False
+            self._adaptive_slot0 = 0
+            self._adaptive_all = 0
+            self._iter_adapt_budget = 0
+            self._cond_max_blocks = 0
+            self._slot0_beam = 0
+            self._protect_d1 = False
+            self._strat_beam = 0
+            self._hidden_slot_cap = 0
+            self._diverse_beam = False
+            self._coverage_prune = False
+            self._tree_fixed_n = 0
+            if os.environ.get("SPECBLOCK_DYNAMIC_TREE", "0") == "1":
+                raise ValueError("strict_linear is incompatible with SPECBLOCK_DYNAMIC_TREE=1")
+            linear_k0 = self._tree_K if self._tree_K is not None and self._tree_K < self.K else self.K
+            linear_kb = linear_k0
+            if self._tree_K_bfs is not None and self._tree_K_bfs < self.K:
+                linear_kb = self._tree_K_bfs
+            self._strict_linear_nodes = linear_k0 + max(0, self.max_blocks - 1) * linear_kb
+            if self.total_tokens != self._strict_linear_nodes:
+                raise ValueError(
+                    "strict_linear requires the unpruned chain budget: "
+                    f"total_tokens={self.total_tokens}, expected={self._strict_linear_nodes} "
+                    f"for max_blocks={self.max_blocks}, tree_K={linear_k0}, "
+                    f"tree_K_bfs={linear_kb}"
+                )
+            print(
+                "  Strict linear path enabled: "
+                f"{self._strict_linear_nodes} draft nodes, no branching"
+            )
+        else:
+            self._strict_linear_nodes = None
         # Pre-build rank→factor lookup table (moved to GPU after model load)
         self._rank_to_factor = torch.tensor([0, 4, 10, 0], dtype=torch.long)
         # Persistent reusable buffers (lazily initialized on first tree build to
@@ -625,41 +687,348 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         # Reusable target tree-attention mask buffer (avoids per-iter alloc)
         self._verify_mask_buf = None
 
+    def _batch_tree_budget_for_prompt(self, prompt_len: int) -> int:
+        """Return the request-local tree budget used by the batched draft loop."""
+        return int(self.total_tokens)
+
+    def _chat_template_kwargs(self) -> Dict[str, Any]:
+        """Return model-specific chat-template options for every generation path."""
+        return {}
+
+    def generate_conversations(
+        self,
+        conversations: List[List[Dict[str, str]]],
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        **kwargs,
+    ) -> List[Dict]:
+        """Run the shared request-level batch core, including for B=1."""
+        from .specblock_batch import generate_conversations
+
+        return generate_conversations(
+            self,
+            conversations,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            **kwargs,
+        )
+
+    def reset_after_warmup(self):
+        """Remove session statistics learned from unmeasured warmup prompts."""
+        self._target_want_count = None
+        self._draft_want_count = None
+        self._ngram_table.clear()
+        self._ngram_prev2 = (-1, -1)
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        samples: List[Dict],
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        **kwargs,
+    ) -> List[Dict]:
+        """Batch samples by conversation turn without serial target forwards."""
+        if self.tokenizer is None:
+            self.load_model()
+        if not self.supports_true_batch:
+            if len(samples) > 1:
+                raise NotImplementedError(
+                    f"{type(self).__name__} has request-local hooks and does not "
+                    "support true request batching"
+                )
+            return BaseAlgorithm.generate(
+                self,
+                samples,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+        if not samples:
+            self.last_batch_metrics = {
+                "wall_time": 0.0,
+                "prefill_time": 0.0,
+                "draft_time": 0.0,
+                "target_time": 0.0,
+                "verify_time": 0.0,
+                "iterations": 0,
+                "active_sizes": [],
+                "engine_batch_size": 0,
+            }
+            return []
+
+        contexts = []
+        for sample in samples:
+            turns = sample.get("turns")
+            if turns:
+                contexts.append({
+                    "turns": list(turns),
+                    "turn_idx": 0,
+                    "messages": self.prepare_conversation([]),
+                    "outputs": [],
+                    "metric_rows": [],
+                    "result": None,
+                })
+            else:
+                conversation = self.prepare_conversation(
+                    list(sample.get("conversation", []))
+                )
+                contexts.append({
+                    "turns": None,
+                    "turn_idx": 0,
+                    "messages": conversation,
+                    "outputs": None,
+                    "metric_rows": None,
+                    "result": None,
+                })
+
+        batch_rows = []
+        max_engine_batch = 0
+        while True:
+            pending_conversations = []
+            pending_contexts = []
+            for context in contexts:
+                if context["result"] is not None:
+                    continue
+                turns = context["turns"]
+                if turns is None:
+                    if context["turn_idx"] > 0:
+                        continue
+                    pending_conversations.append(context["messages"])
+                    pending_contexts.append(context)
+                elif context["turn_idx"] < len(turns):
+                    context["messages"].append({
+                        "role": "user",
+                        "content": turns[context["turn_idx"]],
+                    })
+                    pending_conversations.append(context["messages"].copy())
+                    pending_contexts.append(context)
+
+            if not pending_conversations:
+                break
+
+            max_engine_batch = max(max_engine_batch, len(pending_conversations))
+            responses = self.generate_conversations(
+                pending_conversations,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
+            batch_rows.append(dict(self.last_batch_metrics or {}))
+
+            for context, response in zip(pending_contexts, responses):
+                if context["turns"] is None:
+                    context["result"] = response
+                    context["turn_idx"] = 1
+                    continue
+                output = response["output"]
+                context["outputs"].append(output)
+                context["metric_rows"].append(response.get("metrics", {}))
+                context["messages"].append({"role": "assistant", "content": output})
+                context["turn_idx"] += 1
+                if context["turn_idx"] >= len(context["turns"]):
+                    rows = context["metric_rows"]
+                    accept_lengths = [
+                        value
+                        for row in rows
+                        for value in row.get("accept_lengths_raw", [])
+                    ]
+                    total_tokens = sum(row.get("total_tokens", 0) for row in rows)
+                    wall_time = sum(row.get("wall_time", 0.0) for row in rows)
+                    prefill_time = sum(row.get("prefill_time", 0.0) for row in rows)
+                    draft_time = sum(row.get("draft_time", 0.0) for row in rows)
+                    target_time = sum(row.get("target_time", 0.0) for row in rows)
+                    verify_time = sum(row.get("verify_time", 0.0) for row in rows)
+                    other_time = sum(row.get("other_time", 0.0) for row in rows)
+                    context["result"] = {
+                        "output": context["outputs"],
+                        "metrics": {
+                            "total_tokens": total_tokens,
+                            "output_token_ids": [
+                                token_id
+                                for row in rows
+                                for token_id in row.get("output_token_ids", [])
+                            ],
+                            "wall_time": wall_time,
+                            "tokens_per_second": total_tokens / wall_time if wall_time > 0 else 0.0,
+                            "accept_length": self.compute_accept_length(accept_lengths),
+                            "iterations": sum(row.get("iterations", 0) for row in rows),
+                            "num_turns": len(context["turns"]),
+                            "accept_lengths_raw": accept_lengths,
+                            "prefill_time": prefill_time,
+                            "draft_time": draft_time,
+                            "target_time": target_time,
+                            "verify_time": verify_time,
+                            "other_time": other_time,
+                            "draft_pct": draft_time / wall_time * 100 if wall_time > 0 else 0.0,
+                            "target_pct": target_time / wall_time * 100 if wall_time > 0 else 0.0,
+                            "verify_pct": verify_time / wall_time * 100 if wall_time > 0 else 0.0,
+                        },
+                    }
+
+        wall_time = sum(row.get("wall_time", 0.0) for row in batch_rows)
+        prefill_time = sum(row.get("prefill_time", 0.0) for row in batch_rows)
+        draft_time = sum(row.get("draft_time", 0.0) for row in batch_rows)
+        target_time = sum(row.get("target_time", 0.0) for row in batch_rows)
+        verify_time = sum(row.get("verify_time", 0.0) for row in batch_rows)
+        other_time = sum(row.get("batch_other_time", 0.0) for row in batch_rows)
+        decode_rounds = sum(row.get("iterations", 0) for row in batch_rows)
+        active_sizes = [
+            size for row in batch_rows for size in row.get("active_sizes", [])
+        ]
+        block2_packed_leaves = sum(
+            row.get("block2_packed_leaves", 0) for row in batch_rows
+        )
+        block2_padded_capacity = sum(
+            row.get("block2_padded_capacity", 0) for row in batch_rows
+        )
+        target_prefill_lm_head_rows = sum(
+            row.get("target_prefill_lm_head_rows", 0) for row in batch_rows
+        )
+        target_prefill_lm_head_capacity = sum(
+            row.get("target_prefill_lm_head_capacity", 0) for row in batch_rows
+        )
+        target_verify_lm_head_rows = sum(
+            row.get("target_verify_lm_head_rows", 0) for row in batch_rows
+        )
+        target_verify_lm_head_capacity = sum(
+            row.get("target_verify_lm_head_capacity", 0) for row in batch_rows
+        )
+        target_trace_names = (
+            "target_attention_widths",
+            "target_fixed_attention_widths",
+            "target_committed_widths",
+            "target_tree_starts",
+            "target_tree_widths",
+            "target_commit_reserves",
+        )
+        target_traces = {
+            name: [
+                value
+                for row in batch_rows
+                for value in row.get(name, [])
+            ]
+            for name in target_trace_names
+        }
+        draft_forward_times = {}
+        for row in batch_rows:
+            for depth, value in row.get("draft_forward_times", {}).items():
+                draft_forward_times[depth] = (
+                    draft_forward_times.get(depth, 0.0) + value
+                )
+        self.last_batch_metrics = {
+            "wall_time": wall_time,
+            "prefill_time": prefill_time,
+            "draft_time": draft_time,
+            "target_time": target_time,
+            "verify_time": verify_time,
+            "iterations": decode_rounds,
+            "active_sizes": active_sizes,
+            **target_traces,
+            "target_prefill_lm_head_rows": target_prefill_lm_head_rows,
+            "target_prefill_lm_head_capacity": target_prefill_lm_head_capacity,
+            "target_verify_lm_head_rows": target_verify_lm_head_rows,
+            "target_verify_lm_head_capacity": target_verify_lm_head_capacity,
+            "target_lm_head_rows_removed": (
+                target_prefill_lm_head_capacity
+                + target_verify_lm_head_capacity
+                - target_prefill_lm_head_rows
+                - target_verify_lm_head_rows
+            ),
+            "block2_packed_leaves": block2_packed_leaves,
+            "block2_padded_capacity": block2_padded_capacity,
+            "block2_padding_removed": (
+                block2_padded_capacity - block2_packed_leaves
+            ),
+            "block2_padding_removed_pct": (
+                100.0
+                * (block2_padded_capacity - block2_packed_leaves)
+                / block2_padded_capacity
+                if block2_padded_capacity > 0
+                else 0.0
+            ),
+            "draft_forward_times": draft_forward_times,
+            "engine_batch_size": max_engine_batch,
+            "batch_wall_time": wall_time,
+            "batch_prefill_time": prefill_time,
+            "batch_draft_time": draft_time,
+            "batch_target_time": target_time,
+            "batch_verify_time": verify_time,
+            "batch_other_time": other_time,
+            "batch_decode_rounds": decode_rounds,
+            "batch_size": max_engine_batch,
+            "turn_batches": len(batch_rows),
+        }
+        return [context["result"] for context in contexts]
+
+    @staticmethod
+    def _assert_target_runtime_environment():
+        import transformers
+
+        expected_version = "4.57.6"
+        if transformers.__version__ != expected_version:
+            raise RuntimeError(
+                "HF SpecBlock target batching is validated only with "
+                f"transformers=={expected_version}; got {transformers.__version__}"
+            )
+        if os.environ.get("TARGET_COMPILE", "0") != "0":
+            raise RuntimeError(
+                "selective target materialization requires TARGET_COMPILE=0; "
+                "compiling the CausalLM wrapper would be bypassed"
+            )
+
+    @classmethod
+    def _assert_target_runtime_contract(cls, target_model):
+        cls._assert_target_runtime_environment()
+        config = target_model.config
+        backbone = getattr(target_model, "model", None)
+        layers = getattr(backbone, "layers", None)
+        lm_head = getattr(target_model, "lm_head", None)
+        if (
+            getattr(config, "model_type", None) != "llama"
+            or not isinstance(layers, torch.nn.ModuleList)
+            or len(layers) != int(config.num_hidden_layers)
+            or not callable(getattr(backbone, "forward", None))
+            or not callable(getattr(lm_head, "forward", None))
+            or int(getattr(lm_head, "out_features", -1))
+            != int(config.vocab_size)
+        ):
+            raise RuntimeError(
+                "HF SpecBlock target batching requires the validated "
+                "LlamaForCausalLM model/layers/lm_head contract"
+            )
+
     def load_model(self):
         """Load target model and SpecBlock draft model."""
+        from .hf_fused_projections import fuse_llama_target_projections
+
+        self._assert_target_runtime_environment()
         print(f"Loading target model from {self.model_path}...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.target_model = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            torch_dtype=torch.bfloat16,
-            device_map=self.device,
-            trust_remote_code=True,
-        )
-        self.target_model.eval()
+        attn_impl = os.environ.get("TARGET_ATTN_IMPL", "triton_tree")
+        if attn_impl == "flashinfer_tree":
+            from .target_flashinfer_attn import register as register_flashinfer
 
-        # Optional: torch.compile target model for CUDA graph / kernel launch
-        # overhead elimination. Profile shows target forward 42ms/iter with
-        # ~320 kernel launches (~10ms launch overhead). reduce-overhead mode
-        # uses CUDA graphs internally. Env-gated TARGET_COMPILE=1 to enable.
-        _tc_mode = os.environ.get('TARGET_COMPILE', '0')
-        if _tc_mode == '1':
-            print("  [TARGET_COMPILE=1] torch.compile target.forward mode='reduce-overhead'")
-            self.target_model.forward = torch.compile(
-                self.target_model.forward,
-                mode='reduce-overhead',
-                dynamic=True,
-                fullgraph=False,
-            )
-        elif _tc_mode == '2':
-            print("  [TARGET_COMPILE=2] torch.compile target.forward mode='default' (triton fusion)")
-            self.target_model.forward = torch.compile(
-                self.target_model.forward,
-                mode='default',
-                dynamic=True,
-                fullgraph=False,
-            )
+            register_flashinfer(name="flashinfer_tree")
+        elif attn_impl == "triton_tree":
+            from .target_triton_attn import register as register_triton
+
+            register_triton(name="triton_tree")
+        load_kwargs = {
+            "torch_dtype": torch.bfloat16,
+            "device_map": self.device,
+            "trust_remote_code": True,
+        }
+        if attn_impl and attn_impl != "sdpa":
+            load_kwargs["attn_implementation"] = attn_impl
+        self.target_model = AutoModelForCausalLM.from_pretrained(
+            self.model_path, **load_kwargs
+        )
+        fuse_llama_target_projections(self.target_model)
+        self._assert_target_runtime_contract(self.target_model)
+        self.target_model.eval()
 
         num_layers = self.target_model.config.num_hidden_layers
         offset = 1
@@ -725,7 +1094,10 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         # Uniformly branches MAX_TOPK alts per slot; rank-aware effects live
         # in the prune-time cumulative bias (preserves cum_lp monotonicity).
         self._static_draft = None
-        self._use_static_draft = os.environ.get("SPECBLOCK_STATIC", "0") == "1"
+        self._use_static_draft = (
+            not self._strict_linear
+            and os.environ.get("SPECBLOCK_STATIC", "0") == "1"
+        )
         if self._use_static_draft:
             try:
                 from .specblock_static_draft import StaticDraftBuilder
@@ -945,9 +1317,11 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
             ))
         return pool[idx]
 
+    def _select_hidden_3h_sources(self, hidden_states):
+        return tuple(hidden_states[i] for i in self.hidden_layer_indices)
+
     def _extract_hidden_3h(self, hidden_states) -> torch.Tensor:
-        selected = [hidden_states[i] for i in self.hidden_layer_indices]
-        return torch.cat(selected, dim=-1)
+        return torch.cat(self._select_hidden_3h_sources(hidden_states), dim=-1)
 
     def _needs_vocab_mapping(self) -> bool:
         if not hasattr(self, '_vocab_mapping_needed'):
@@ -982,12 +1356,20 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         'balanced':    [4, 4, 4, 4],     # balanced across all ranks, used with lower beam_width
         'hidden_div':  [6, 6, 6, 4],     # more alts at deeper slots for hidden diversity (use with beam_width=5)
         'slot0_only':  [1, 1, 1, 1],    # only slot 0 branches (beam_width), slots 1-3 greedy only
+        'linear':      [1, 1, 1, 1],    # strict mode also forces slot-0 beam=1 and no give-up break
         'slim_r2':     [2, 4, 6, 4],    # slim rank=2 from 10 to 6 (reduce d3/d4 duplicate budget)
         'slim_r2b':    [2, 3, 5, 3],    # even slimmer on d3/d4
     }
 
     def _walk_rank_slots_batch(self, rank_preds: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Batched rank walking for N leaves. Zero .item() calls."""
+        if self._strict_linear:
+            batch = rank_preds.shape[0]
+            return (
+                torch.full((batch,), rank_preds.shape[1], dtype=torch.long, device=rank_preds.device),
+                torch.zeros(batch, dtype=torch.long, device=rank_preds.device),
+                torch.zeros(batch, dtype=torch.bool, device=rank_preds.device),
+            )
         return _walk_rank_slots_compiled(rank_preds, self.rank_classes, self._rank_to_factor)
 
     def _aggregate_rank_stats(
@@ -1412,42 +1794,15 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         if not hasattr(self, '_path_logged'):
             print(f'[PATH] static={self._use_static_draft} gpu_supported={self._tree_gpu_supported()} build_triton={self._tree_build_triton} build_cuda={self._tree_build_cuda} tree_gpu={self._tree_gpu}', flush=True)
             self._path_logged = True
-        if self._use_static_draft and self._static_draft is not None:
-            return self._static_draft.build_tree(
-                b0_logits=logits,
-                b0_rank_logits=rank_logits,
-                b0_draft_hidden=draft_hidden,
-                b0_ttt_kv=ttt_kv,
-                input_id=input_id,
-                draft_cache=draft_cache,
-                draft_position=draft_position,
-                temperature=temperature,
-            )
-        if (self._tree_build_cuda and self._tree_fixed_n > 0
-                and self._tree_gpu_supported()):
-            return self._build_tree_from_block1_cuda_fixed(
-                logits, rank_logits, draft_hidden, ttt_kv,
-                input_id, draft_cache, draft_position, temperature,
-            )
-        if self._tree_build_cuda and self._tree_gpu_supported():
-            return self._build_tree_from_block1_cuda(
-                logits, rank_logits, draft_hidden, ttt_kv,
-                input_id, draft_cache, draft_position, temperature,
-            )
-        if self._tree_build_triton and self._tree_gpu_supported():
-            return self._build_tree_from_block1_triton(
-                logits, rank_logits, draft_hidden, ttt_kv,
-                input_id, draft_cache, draft_position, temperature,
-            )
-        if self._tree_gpu and self._tree_gpu_supported():
-            return self._build_tree_from_block1_gpu(
-                logits, rank_logits, draft_hidden, ttt_kv,
-                input_id, draft_cache, draft_position, temperature,
-            )
-
-        return self._build_tree_from_block1(
-            logits, rank_logits, draft_hidden, ttt_kv,
-            input_id, draft_cache, draft_position, temperature,
+        return self._build_tree_from_block1_dispatch(
+            logits,
+            rank_logits,
+            draft_hidden,
+            ttt_kv,
+            input_id,
+            draft_cache,
+            draft_position,
+            temperature=temperature,
         )
 
     def _tree_gpu_supported(self) -> bool:
@@ -1904,7 +2259,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         )
 
     def _finalize_gpu_tree(self, n_nodes, buf, sample_token, device, K,
-                           all_rank_stats, draft_position):
+                           all_rank_stats, draft_position, tree_budget=None):
         """Final GPU→CPU transfer + numpy prune + triton topology.
 
         Single-sync transfer: both the int64 stack and float32 lps copy into
@@ -1914,12 +2269,13 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         """
         # GPU-resident path: prune + topology all on GPU. Skips the pinned
         # transfer + numpy prune entirely.
+        tree_budget = self.total_tokens if tree_budget is None else int(tree_budget)
         if getattr(self, '_tree_finalize_cuda', False):
             return self._finalize_gpu_tree_v2(
                 n_nodes, buf, sample_token, device, K,
-                all_rank_stats, draft_position,
+                all_rank_stats, draft_position, tree_budget=tree_budget,
             )
-        max_nodes_np = max(self.total_tokens + 500, n_nodes)
+        max_nodes_np = max(tree_budget + 500, n_nodes)
         tn_tokens, tn_parents, tn_lps, tn_ranks, tn_blocks, tn_slots = \
             self._ensure_tree_buffers(max_nodes_np)
 
@@ -1956,10 +2312,10 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         tn_lps[:n_nodes] = lps_cpu.astype(np.float64)
 
         # Prune if over budget
-        if n_nodes > self.total_tokens:
+        if n_nodes > tree_budget:
             n_nodes = self._prune_tree_np(
                 n_nodes, tn_tokens, tn_parents, tn_lps, tn_ranks, tn_blocks, tn_slots,
-                self.total_tokens,
+                tree_budget,
             )
 
         tree_tokens, tree_mask, tree_position_ids, retrieve_indices = \
@@ -1976,7 +2332,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
                 all_rank_stats, node_ranks, node_block_slots)
 
     def _finalize_gpu_tree_v2(self, n_nodes, buf, sample_token, device, K,
-                              all_rank_stats, draft_position):
+                              all_rank_stats, draft_position, tree_budget=None):
         """GPU-resident finalize: prune + topology, ~0 numpy time.
 
         Drop-in replacement for _finalize_gpu_tree under TREE_FINALIZE_CUDA=1.
@@ -1985,9 +2341,10 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         """
         from .tree_finalize_triton import finalize_tree_gpu
 
+        tree_budget = self.total_tokens if tree_budget is None else int(tree_budget)
         (draft_tokens, tree_mask, tree_position_ids, retrieve_indices,
          node_ranks, node_block_slots, new_n) = finalize_tree_gpu(
-            buf, n_nodes, sample_token, self.total_tokens, K, self.max_blocks,
+            buf, n_nodes, sample_token, tree_budget, K, self.max_blocks,
             _tree_depth_mask_kernel, _tree_retrieve_kernel,
             max_tree_depth=MAX_TREE_DEPTH,
         )
@@ -2218,7 +2575,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
             self._block_forward_events[1].append((blk_start, blk_end))
         _nv_pop()
 
-        # Online adapt: cache block-2 BFS forward outputs so the
+        # Online adapt (2026-04-25): cache block-2 BFS forward outputs so the
         # hook layer can extract per-(leaf, slot) draft logits/hidden when a
         # tree-node reject lands in block_idx >= 1. Zero-overhead when adapt
         # is not enabled (getattr default False); spec-block-shift inference
@@ -2287,6 +2644,474 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         )
         _nv_pop()
         return _result
+
+    def _get_batched_triton_scratch(
+        self,
+        row: int,
+        device: torch.device,
+        tree_budget: int,
+        max_topk: int,
+    ):
+        """Return persistent request-owned scratch for the batched Triton tree path."""
+        K = self.K
+        max_block1_nodes = K + K * (max_topk - 1) + 1
+        max_block2_nodes = max_block1_nodes * K * max_topk
+        max_nodes = max(
+            int(tree_budget) + 200,
+            max_block1_nodes + max_block2_nodes + 100,
+        )
+        pool = getattr(self, "_batched_triton_scratch", None)
+        if pool is None:
+            pool = []
+            self._batched_triton_scratch = pool
+        while len(pool) <= row:
+            pool.append(None)
+        scratch = pool[row]
+        if (
+            scratch is None
+            or scratch["device"] != device
+            or scratch["buf"]["tokens"].shape[0] < max_nodes
+            or scratch["pend_buf"]["hidden_slots"].shape[0] < max_block1_nodes
+        ):
+            scratch = {
+                "device": device,
+                "buf": {
+                    "tokens": torch.empty(max_nodes, dtype=torch.long, device=device),
+                    "parents": torch.empty(max_nodes, dtype=torch.long, device=device),
+                    "lps": torch.empty(max_nodes, dtype=torch.float32, device=device),
+                    "ranks": torch.empty(max_nodes, dtype=torch.long, device=device),
+                    "blocks": torch.empty(max_nodes, dtype=torch.long, device=device),
+                    "slots": torch.empty(max_nodes, dtype=torch.long, device=device),
+                },
+                "pend_buf": {
+                    "hidden_slots": torch.empty(max_block1_nodes, dtype=torch.long, device=device),
+                    "input_ids": torch.empty(max_block1_nodes, dtype=torch.long, device=device),
+                    "ttt_valid": torch.empty(max_block1_nodes, dtype=torch.long, device=device),
+                    "node_indices": torch.empty(max_block1_nodes, dtype=torch.long, device=device),
+                    "cum_lps": torch.empty(max_block1_nodes, dtype=torch.float32, device=device),
+                },
+                "sizes4": torch.empty(4, dtype=torch.long, device=device),
+                "sizes1": torch.empty(1, dtype=torch.long, device=device),
+                "cum_alt_buf": torch.empty(32, dtype=torch.long, device=device),
+            }
+            pool[row] = scratch
+        return scratch
+
+    def _prepare_tree_from_block1_triton_batched(
+        self,
+        logits,
+        rank_logits,
+        draft_hidden,
+        ttt_kv,
+        input_id,
+        draft_position: int,
+        tree_budget: int,
+        scratch_row: int,
+    ):
+        """Prepare one request through block-1 while retaining request-owned scratch."""
+        from .tree_build_triton import triton_launch_block1
+
+        K = self.K
+        device = logits.device
+        rank_classes = self.rank_classes
+        give_up_class = rank_classes - 1
+        max_topk = max(self.beam_width, max(self.RANK_SLOT_TOPK))
+        scratch = self._get_batched_triton_scratch(
+            scratch_row, device, tree_budget, max_topk,
+        )
+        buf = scratch["buf"]
+        pend_buf = scratch["pend_buf"]
+        rank_slot_topk_table = getattr(self, "_triton_rank_slot_topk_t", None)
+        if rank_slot_topk_table is None or rank_slot_topk_table.device != device:
+            rank_slot_topk_table = torch.tensor(
+                self.RANK_SLOT_TOPK, dtype=torch.long, device=device,
+            )
+            self._triton_rank_slot_topk_t = rank_slot_topk_table
+
+        last_p = logits[0]
+        log_probs = F.log_softmax(last_p.float(), dim=-1)
+        rank_preds = rank_logits[0].argmax(dim=-1)
+        top_idx = torch.topk(last_p, max_topk, dim=-1).indices
+        top_target = self._map_draft_to_target(top_idx)
+        top_lps = log_probs.gather(1, top_idx)
+        greedy_target = top_target[:, 0].contiguous()
+        greedy_lps = top_lps[:, 0].contiguous()
+        triton_launch_block1(
+            rank_preds,
+            greedy_target,
+            greedy_lps,
+            top_target,
+            top_lps,
+            rank_slot_topk_table,
+            buf,
+            pend_buf,
+            scratch["sizes4"],
+            self.beam_width,
+            K,
+            max_topk,
+            rank_classes,
+            give_up_class,
+            self._adaptive_slot0,
+            self._adaptive_all,
+        )
+        return {
+            "row": scratch_row,
+            "tree_budget": int(tree_budget),
+            "draft_position": int(draft_position),
+            "sample_token": input_id[:, -1],
+            "buf": buf,
+            "pend_buf": pend_buf,
+            "sizes4": scratch["sizes4"],
+            "sizes1": scratch["sizes1"],
+            "cum_alt_buf": scratch["cum_alt_buf"],
+            "rank_stats": [{
+                "rank_preds": [0] * K,
+                "M": K,
+                "branch": 0,
+                "parent_block": -1,
+            }],
+            "rank_slot_topk": rank_slot_topk_table,
+            "max_topk": max_topk,
+            "ttt_kv": ttt_kv,
+            "draft_hidden": draft_hidden,
+        }
+
+    def _consume_tree_block1_triton_batched(self, context, sizes):
+        """Consume one request after the batch-wide block-1 size readback."""
+        if len(sizes) != 4:
+            raise ValueError("block-1 size metadata must contain four values")
+        n_nodes_b1, _n_active, _total_alts1, n_pending = map(int, sizes)
+        context["n_nodes_b1"] = n_nodes_b1
+        context["n_pending"] = n_pending
+        if n_pending == 0:
+            context["result"] = self._finalize_gpu_tree(
+                n_nodes_b1,
+                context["buf"],
+                context["sample_token"],
+                context["sample_token"].device,
+                self.K,
+                context["rank_stats"],
+                context["draft_position"],
+                tree_budget=context["tree_budget"],
+            )
+            context.pop("draft_hidden", None)
+            return context
+
+        pend_buf = context["pend_buf"]
+        pend_slots = pend_buf["hidden_slots"][:n_pending]
+        draft_hidden = context.pop("draft_hidden")
+        context.update({
+            "pend_hidden": draft_hidden[0, pend_slots, :].unsqueeze(1),
+            "pend_input_ids": pend_buf["input_ids"][:n_pending].unsqueeze(1),
+            "ttt_mask": (
+                self._arange_K_t.unsqueeze(0)
+                < pend_buf["ttt_valid"][:n_pending].unsqueeze(1)
+            ),
+            "pend_node_indices": pend_buf["node_indices"][:n_pending],
+            "pend_cum_lps": pend_buf["cum_lps"][:n_pending],
+        })
+        return context
+
+    def _launch_tree_block2_triton_batched(
+        self,
+        context,
+        rank_preds,
+        greedy_target,
+        greedy_lps,
+        top_target,
+        top_lps,
+    ):
+        """Launch one request's BFS kernels without reading size metadata."""
+        from .tree_build_triton import triton_launch_bfs
+
+        K = self.K
+        n_pending = context["n_pending"]
+        cum_alt_buf = context["cum_alt_buf"]
+        block_n = int(cum_alt_buf.shape[0])
+        if n_pending > block_n:
+            block_n = max(64, 1 << (n_pending - 1).bit_length())
+            cum_alt_buf = torch.empty(
+                block_n, dtype=torch.long, device=rank_preds.device,
+            )
+            context["cum_alt_buf"] = cum_alt_buf
+            self._batched_triton_scratch[context["row"]]["cum_alt_buf"] = cum_alt_buf
+        triton_launch_bfs(
+            rank_preds,
+            greedy_target,
+            greedy_lps,
+            top_target,
+            top_lps,
+            context["pend_cum_lps"],
+            context["pend_node_indices"],
+            context["rank_slot_topk"],
+            context["buf"],
+            context["sizes1"],
+            cum_alt_buf,
+            tree_start=context["n_nodes_b1"],
+            N=n_pending,
+            K=K,
+            max_topk=context["max_topk"],
+            rank_classes=self.rank_classes,
+            give_up_class=self.rank_classes - 1,
+            adaptive_all=self._adaptive_all,
+            pend_depth=1,
+            block_n=block_n,
+            j_pad=16,
+        )
+
+    def _finalize_tree_block2_triton_batched(self, context, total_alts):
+        """Finalize one request after the batch-wide BFS size readback."""
+        K = self.K
+        n_pending = context["n_pending"]
+        n_nodes = context["n_nodes_b1"] + n_pending * K + int(total_alts)
+        rank_stats = list(context["rank_stats"])
+        rank_stats.extend({
+            "rank_preds": [0] * K,
+            "M": K,
+            "branch": 0,
+            "parent_block": 0,
+        } for _ in range(n_pending))
+        return self._finalize_gpu_tree(
+            n_nodes,
+            context["buf"],
+            context["sample_token"],
+            context["sample_token"].device,
+            K,
+            rank_stats,
+            context["draft_position"],
+            tree_budget=context["tree_budget"],
+        )
+
+    @torch.no_grad()
+    def _build_trees_from_block1_batched(
+        self,
+        logits,
+        rank_logits,
+        draft_hidden,
+        ttt_kv,
+        input_ids,
+        draft_cache,
+        draft_positions,
+        tree_budgets,
+        temperature: float = 0.0,
+    ):
+        """Build request-local trees around one global block-2 draft forward."""
+        requests = logits.shape[0]
+        if (
+            rank_logits.shape[0] != requests
+            or draft_hidden.shape[0] != requests
+            or input_ids.shape != (requests, 1)
+            or len(draft_positions) != requests
+            or len(tree_budgets) != requests
+        ):
+            raise ValueError("batched block-1 inputs must have one row per request")
+        if len(ttt_kv) != self.draft_model.num_layers:
+            raise ValueError("batched block-1 TTT cache must have one entry per layer")
+        if any(keys.shape[0] != requests for keys, _values in ttt_kv):
+            raise ValueError("batched block-1 TTT cache rows must match requests")
+        if self._strict_linear:
+            linear_rank_logits = torch.full_like(
+                rank_logits, torch.finfo(rank_logits.dtype).min
+            )
+            linear_rank_logits[..., 0] = 0
+            rank_logits = linear_rank_logits
+
+        if draft_cache.use_compiled_b1:
+            if requests != 1:
+                raise RuntimeError("original-engine B1 specialization requires one active request")
+            original_budget = self.total_tokens
+            self.total_tokens = int(tree_budgets[0])
+            try:
+                result = self._build_tree_from_block1_dispatch(
+                    logits,
+                    rank_logits,
+                    draft_hidden,
+                    ttt_kv,
+                    input_ids,
+                    draft_cache.row_view(0),
+                    int(draft_positions[0]),
+                    temperature=temperature,
+                )
+            finally:
+                self.total_tokens = original_budget
+            return [result]
+
+        if self.max_blocks != 2 or not self._tree_gpu_supported():
+            raise RuntimeError("batched SpecBlock trees require the supported two-block GPU config")
+        if not self._tree_build_triton:
+            raise RuntimeError("batched SpecBlock trees require the canonical Triton builder")
+        if self._use_static_draft or self._tree_build_cuda or self._tree_fixed_n > 0:
+            raise RuntimeError("static/CUDA scalar tree builders are unsupported for batched SpecBlock")
+        if getattr(self, "_adapt_collect_block2", False):
+            raise RuntimeError("online block-2 adaptation is unsupported in batched SpecBlock")
+
+        launched_contexts = []
+        results = [None] * requests
+        for row in range(requests):
+            launched_contexts.append(
+                self._prepare_tree_from_block1_triton_batched(
+                    logits[row:row + 1],
+                    rank_logits[row:row + 1],
+                    draft_hidden[row:row + 1],
+                    [
+                        (keys[row:row + 1], values[row:row + 1])
+                        for keys, values in ttt_kv
+                    ],
+                    input_ids[row:row + 1],
+                    int(draft_positions[row]),
+                    int(tree_budgets[row]),
+                    row,
+                )
+            )
+
+        block1_sizes = torch.stack([
+            context["sizes4"] for context in launched_contexts
+        ]).cpu().tolist()
+        self._batched_block1_size_readbacks = (
+            getattr(self, "_batched_block1_size_readbacks", 0) + 1
+        )
+        contexts = []
+        for context, sizes in zip(launched_contexts, block1_sizes):
+            context = self._consume_tree_block1_triton_batched(context, sizes)
+            if "result" in context:
+                results[context["row"]] = context["result"]
+            else:
+                contexts.append(context)
+
+        if contexts:
+            K = self.K
+            lengths_host = draft_cache.lengths_host
+            if len(lengths_host) != requests or any(length < K for length in lengths_host):
+                raise ValueError("shared draft cache lengths must include the current block-1 slots")
+            context_rows = [int(context["row"]) for context in contexts]
+            pending_counts = [int(context["n_pending"]) for context in contexts]
+            if any(count <= 0 for count in pending_counts):
+                raise ValueError("packed block-2 contexts must contain pending leaves")
+            if any(lengths_host[row] <= K for row in context_rows):
+                raise ValueError("packed block-2 attention requires non-empty cross cache rows")
+            effective_lengths = draft_cache.lengths - K
+            effective_cache = [
+                [layer[0], layer[1], effective_lengths, layer[3], None]
+                for layer in draft_cache.layers
+            ]
+            max_cross_count = max(
+                int(lengths_host[row]) - K for row in context_rows
+            )
+
+            pending_hidden = torch.cat([
+                context["pend_hidden"] for context in contexts
+            ], dim=0).contiguous()
+            pending_input_ids = torch.cat([
+                context["pend_input_ids"] for context in contexts
+            ], dim=0).contiguous()
+            pending_ttt_mask = torch.cat([
+                context["ttt_mask"] for context in contexts
+            ], dim=0).contiguous()
+            total_pending = sum(pending_counts)
+            if pending_hidden.shape[0] != total_pending:
+                raise RuntimeError("packed block-2 leaf count is inconsistent")
+            self._batched_block2_packed_leaves = (
+                getattr(self, "_batched_block2_packed_leaves", 0)
+                + total_pending
+            )
+            self._batched_block2_padded_capacity = (
+                getattr(self, "_batched_block2_padded_capacity", 0)
+                + requests * max(pending_counts)
+            )
+            owner_rows = torch.tensor(
+                context_rows,
+                dtype=torch.long,
+                device=logits.device,
+            )
+            owner_counts = torch.tensor(
+                pending_counts,
+                dtype=torch.long,
+                device=logits.device,
+            )
+            leaf_owner = torch.repeat_interleave(
+                owner_rows,
+                owner_counts,
+                output_size=total_pending,
+            ).contiguous()
+            base_positions = torch.as_tensor(
+                draft_positions,
+                dtype=torch.long,
+                device=logits.device,
+            )
+            pos_ids = (
+                base_positions.index_select(0, leaf_owner)[:, None]
+                + 1
+                + self._arange_K_t[None, :]
+            )
+            max_position = max(
+                int(draft_positions[row]) + K for row in context_rows
+            )
+            request_ttt = ttt_kv
+
+            if self._bfs_events_enabled:
+                event_index = len(self._block_forward_events[1])
+                block_start, block_end = self._get_bfs_event_pair(1, event_index)
+                block_start.record()
+            block_logits, block_rank_logits, _block_hidden, _block_ttt = \
+                self.draft_model.forward_block2_ragged(
+                    hidden=pending_hidden,
+                    input_ids=pending_input_ids,
+                    cache=effective_cache,
+                    pos_ids=pos_ids,
+                    max_position=max_position,
+                    ttt_cache=request_ttt,
+                    ttt_mask=pending_ttt_mask,
+                    leaf_owner=leaf_owner,
+                    max_cross_count=max_cross_count,
+                )
+            self._batched_block2_forward_calls = (
+                getattr(self, "_batched_block2_forward_calls", 0) + 1
+            )
+            if self._bfs_events_enabled:
+                block_end.record()
+                self._block_forward_events[1].append((block_start, block_end))
+
+            max_topk = max(self.beam_width, max(self.RANK_SLOT_TOPK))
+            (rank_preds, _greedy_tokens, greedy_target, greedy_lps,
+             _M, _branch_factors, _give_up, top_target, top_lps) = _bfs_gpu_ops_fused(
+                block_logits,
+                block_rank_logits,
+                self.draft_model.d2t,
+                max_topk,
+                self.rank_classes,
+                self._rank_to_factor,
+            )
+            offset = 0
+            for context in contexts:
+                end = offset + context["n_pending"]
+                self._launch_tree_block2_triton_batched(
+                    context,
+                    rank_preds[offset:end],
+                    greedy_target[offset:end],
+                    greedy_lps[offset:end],
+                    top_target[offset:end],
+                    top_lps[offset:end],
+                )
+                offset = end
+
+            bfs_sizes = torch.stack([
+                context["sizes1"] for context in contexts
+            ]).cpu().tolist()
+            self._batched_bfs_size_readbacks = (
+                getattr(self, "_batched_bfs_size_readbacks", 0) + 1
+            )
+            for context, total_alts in zip(contexts, bfs_sizes):
+                results[context["row"]] = (
+                    self._finalize_tree_block2_triton_batched(
+                        context, total_alts[0]
+                    )
+                )
+
+        if any(result is None for result in results):
+            raise RuntimeError("batched SpecBlock tree builder did not finalize every request")
+        if self._strict_linear:
+            return [self._validate_strict_linear_tree(result) for result in results]
+        return results
 
     # ============================================================
     #    TREE_BUILD_CUDA=1 path — native C++/CUDA mega-kernels
@@ -2510,7 +3335,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
           - no host sync on sizes[3] → N_pend is Python constant.
           - BFS forward input shapes are static at [N_fixed, 1, H].
           - enables CUDA graph capture for the BFS forward path
-            (prerequisite for the cc-bucketed graph trial).
+            (prerequisite for the cc-bucketed graph trial in Day 3).
 
         Caveats:
           - Dummies carry ttt_valid=0 so batch_ttt_mask masks them. Their
@@ -2521,7 +3346,11 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
             (total_alts1) still need a host read for the BFS tree_start.
             That's 1 sync instead of the prior 2 syncs for this driver.
         """
-        from .tree_build_cuda_loader import cuda_build_block1_fixed_n, cuda_build_bfs
+        from .tree_build_cuda_loader import (
+            cuda_build_block1_fixed_n,
+            cuda_build_bfs,
+            tree_bfs_required_capacity,
+        )
 
         N_fixed = self._tree_fixed_n
         K = self.K
@@ -2534,10 +3363,16 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         adaptive_all = self._adaptive_all
         max_topk = max(beam_width, max(self.RANK_SLOT_TOPK))
 
-        # Reuse the same lazy buffers as the non-fixed CUDA path.
+        # Fixed-N sends every padded leaf through BFS, so block-2 capacity must
+        # scale with N_fixed rather than the variable block-1 node ceiling.
         max_block1_nodes = K + K * (max_topk - 1) + 1
-        max_block2_nodes = max_block1_nodes * K * max_topk
-        max_nodes = max(self.total_tokens + 200, max_block1_nodes + max_block2_nodes + 100)
+        required_nodes = tree_bfs_required_capacity(
+            max_block1_nodes,
+            N_fixed,
+            K,
+            max_topk,
+        )
+        max_nodes = max(self.total_tokens + 200, required_nodes + 100)
         buf = getattr(self, '_tree_gpu_buf', None)
         if buf is None or buf['tokens'].shape[0] < max_nodes:
             buf = {
@@ -2720,6 +3555,12 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
             pend_depth=1,
         )
         n_nodes_final = n_nodes_b1 + N_fixed * K + total_alts_2
+        tree_capacity = int(buf['tokens'].numel())
+        if n_nodes_final > tree_capacity:
+            raise RuntimeError(
+                "fixed-N CUDA tree output exceeds buffer capacity before finalize: "
+                f"nodes={n_nodes_final}, capacity={tree_capacity}"
+            )
 
         all_rank_stats = list(all_rank_stats_stub)
         for _i in range(N_fixed):
@@ -2732,6 +3573,47 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
             all_rank_stats, draft_position,
         )
 
+    def _validate_strict_linear_tree(self, result):
+        """Fail fast if a strict-linear builder emits siblings or a truncated path."""
+        draft_tokens, tree_mask, tree_position_ids, retrieve_indices = result[:4]
+        expected_width = self._strict_linear_nodes + 1  # verified root + draft path
+        width = int(draft_tokens.shape[-1])
+        expected_path = torch.arange(width, device=retrieve_indices.device)
+        expected_mask = torch.tril(torch.ones(
+            (1, 1, width, width), dtype=tree_mask.dtype, device=tree_mask.device
+        ))
+        retrieve_shape_ok = (
+            retrieve_indices.ndim == 2
+            and retrieve_indices.shape[0] == 1
+            and retrieve_indices.shape[1] >= width
+        )
+        retrieve_path_ok = False
+        if retrieve_shape_ok:
+            retrieve_row = retrieve_indices[0]
+            retrieve_path_ok = (
+                torch.equal(retrieve_row[:width], expected_path)
+                and bool(torch.all(retrieve_row[width:] == -1).item())
+            )
+        if (
+            width != expected_width
+            or not retrieve_path_ok
+            or tuple(tree_mask.shape) != (1, 1, width, width)
+            or not torch.equal(tree_mask, expected_mask)
+            or not torch.equal(
+                tree_position_ids,
+                torch.arange(width, device=tree_position_ids.device),
+            )
+        ):
+            raise RuntimeError(
+                "strict_linear tree invariant failed: "
+                f"draft_width={width}, expected_width={expected_width}, "
+                f"retrieve_shape={tuple(retrieve_indices.shape)}, "
+                f"tree_mask_shape={tuple(tree_mask.shape)}, "
+                f"positions={tree_position_ids.tolist()}, "
+                f"retrieve={retrieve_indices.tolist()}"
+            )
+        return result
+
     @torch.no_grad()
     def _build_tree_from_block1_dispatch(self, *args, **kwargs):
         """Dispatch to GPU-native tree builder when config supports it.
@@ -2742,10 +3624,18 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         Fast path: triton / cuda / tree_gpu specialized kernels.
         Fallback: default numpy path for unsupported configs.
         """
+        if self._strict_linear:
+            # CUDA/Triton block-1 kernels use the first non-zero rank to decide
+            # whether the endpoint may continue. A strict path ignores this rank
+            # policy, so present an all-class-0 view while keeping logits intact.
+            linear_rank_logits = torch.full_like(args[1], torch.finfo(args[1].dtype).min)
+            linear_rank_logits[..., 0] = 0
+            args = (args[0], linear_rank_logits, *args[2:])
+
         if self._use_static_draft and self._static_draft is not None:
-            # args = (logits, rank_logits, draft_hidden, ttt_kv, input_id,
-            #         draft_cache, draft_position, [temperature])
-            return self._static_draft.build_tree(
+            # StaticDraftBuilder returns views into persistent buffers.  Clone
+            # before another request can overwrite them in a batched draft loop.
+            result = _clone_static_tree_result(self._static_draft.build_tree(
                 b0_logits=args[0],
                 b0_rank_logits=args[1],
                 b0_draft_hidden=args[2],
@@ -2757,17 +3647,22 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
                     "temperature",
                     args[7] if len(args) > 7 else 0.0,
                 ),
-            )
-        if (self._tree_build_cuda and self._tree_fixed_n > 0
+            ))
+        elif (self._tree_build_cuda and self._tree_fixed_n > 0
                 and self._tree_gpu_supported()):
-            return self._build_tree_from_block1_cuda_fixed(*args, **kwargs)
-        if self._tree_build_cuda and self._tree_gpu_supported():
-            return self._build_tree_from_block1_cuda(*args, **kwargs)
-        if self._tree_build_triton and self._tree_gpu_supported():
-            return self._build_tree_from_block1_triton(*args, **kwargs)
-        if self._tree_gpu and self._tree_gpu_supported():
-            return self._build_tree_from_block1_gpu(*args, **kwargs)
-        return self._build_tree_from_block1(*args, **kwargs)
+            result = self._build_tree_from_block1_cuda_fixed(*args, **kwargs)
+        elif self._tree_build_cuda and self._tree_gpu_supported():
+            result = self._build_tree_from_block1_cuda(*args, **kwargs)
+        elif self._tree_build_triton and self._tree_gpu_supported():
+            result = self._build_tree_from_block1_triton(*args, **kwargs)
+        elif self._tree_gpu and self._tree_gpu_supported():
+            result = self._build_tree_from_block1_gpu(*args, **kwargs)
+        else:
+            result = self._build_tree_from_block1(*args, **kwargs)
+
+        if self._strict_linear:
+            return self._validate_strict_linear_tree(result)
+        return result
 
     def _build_tree_from_block1(
         self,
@@ -3884,7 +4779,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         N_plus_1 = draft_tokens.shape[1]
         device = draft_tokens.device
         total_len = prefix_len + N_plus_1
-        min_val = torch.finfo(torch.bfloat16).min
+        min_val = float("-inf")
 
         # Preallocate / grow mask buffer once and reuse across iterations
         if (self._verify_mask_buf is None
@@ -3900,9 +4795,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         full_attn_mask = self._verify_mask_buf[:, :, :N_plus_1, :total_len]
         full_attn_mask.fill_(min_val)
         full_attn_mask[..., :prefix_len] = 0.0
-        full_attn_mask[..., prefix_len:].masked_fill_(
-            tree_mask.to(dtype=torch.bool), 0.0
-        )
+        full_attn_mask[..., prefix_len:][tree_mask.bool()] = 0.0
 
         # Target forward with tree attention.
         # Env-gated SDP backend selection: default (auto-select by PyTorch based on mask
@@ -4204,361 +5097,15 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         conversation: List[Dict[str, str]],
         max_new_tokens: int,
         temperature: float,
-        **kwargs
+        **kwargs,
     ) -> Dict:
-        """Generate response using SpecBlock tree speculative decoding."""
-        prompt = self.tokenizer.apply_chat_template(
-            conversation, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
-        input_ids = inputs.input_ids
-        input_length = input_ids.shape[1]
-
-        max_iterations = max_new_tokens + 10
-        self._ensure_events_pool(max_iterations)
-
-        iterations = 0
-        draft_events = 0
-        accept_lengths_raw = []
-        all_iter_rank_stats = []
-        # Store raw data for deferred block-pos stats computation
-        all_iter_bp_raw = []
-        self._block_forward_events = defaultdict(list)
-
-        # Pre-allocate input_ids buffer to avoid repeated torch.cat
-        max_total_len = input_length + max_new_tokens + 16
-        input_ids_buf = torch.zeros(1, max_total_len, dtype=torch.long, device=self.device)
-        input_ids_buf[0, :input_length] = input_ids[0]
-        cur_len = input_length
-
-        # Use CUDA events for consistent wall time measurement
-        _wall_start_event = torch.cuda.Event(enable_timing=True)
-        _wall_end_event = torch.cuda.Event(enable_timing=True)
-
-        # Pre-allocate block timing events to avoid per-iteration allocation
-        _blk0_starts = [torch.cuda.Event(enable_timing=True) for _ in range(max_iterations)]
-        _blk0_ends = [torch.cuda.Event(enable_timing=True) for _ in range(max_iterations)]
-        _blk0_count = 0
-
-
-        with torch.no_grad():
-            # === Prefill ===
-            _wall_start_event.record()
-            self._events_pool['prefill_start'].record()
-
-            target_outputs = self.target_model(
-                input_ids,
-                use_cache=True,
-                output_hidden_states=True,
-            )
-            past_key_values = target_outputs.past_key_values
-            all_hidden_states = target_outputs.hidden_states
-            prefill_logits = target_outputs.logits
-
-            hidden_3h = self._extract_hidden_3h(all_hidden_states)
-
-            if temperature > 0:
-                probs = F.softmax(prefill_logits[:, -1, :] / temperature, dim=-1)
-                first_token = torch.multinomial(probs, num_samples=1)
-            else:
-                first_token = torch.argmax(prefill_logits[:, -1, :], dim=-1, keepdim=True)
-
-            last_hidden_3h = hidden_3h[:, -1:, :]
-
-            # Check EOS
-            if first_token[0, 0] == self.tokenizer.eos_token_id:
-                torch.cuda.synchronize()
-                input_ids_buf[0, cur_len] = first_token[0, 0]
-                cur_len += 1
-                output_ids = input_ids_buf[0, input_length:cur_len]
-                return {
-                    "output": self.tokenizer.decode(output_ids, skip_special_tokens=True),
-                    "metrics": {
-                        "total_tokens": len(output_ids),
-                        "wall_time": 0, "tokens_per_second": 0,
-                        "accept_length": 0, "iterations": 0,
-                    }
-                }
-
-            current_token = first_token
-
-            # Merged draft prefill + first draft (saves one forward pass)
-            shifted_input_ids = torch.cat([input_ids[:, 1:], first_token], dim=1)
-            draft_cache, draft_position, b0_logits, b0_rank_logits, b0_draft_hidden, b0_ttt_kv = \
-                self.draft_model.prefill_and_draft(
-                    hidden_3h, shifted_input_ids, last_hidden_3h, current_token,
-                )
-
-            self._events_pool['prefill_end'].record()
-
-            # === First Draft tree building (no separate forward needed) ===
-            self._events_pool['draft_start'][0].record()
-
-            draft_tokens, tree_mask, tree_position_ids, retrieve_indices, iter_rank_stats, node_ranks, node_block_slots = \
-                self._build_tree_from_block1_dispatch(
-                    b0_logits, b0_rank_logits, b0_draft_hidden, b0_ttt_kv,
-                    current_token, draft_cache, draft_position - 1,
-                    temperature=temperature,
-                )
-
-            self._events_pool['draft_end'][0].record()
-            draft_events = 1
-
-            # === OnlineAdapt hook: tree just built (initial) ===
-            _adapt_hooks = getattr(self, '_adapt_hooks', None)
-            if _adapt_hooks is not None:
-                _adapt_hooks.on_tree_built(
-                    draft_tokens=draft_tokens, logits=b0_logits,
-                    rank_logits=b0_rank_logits, draft_hidden=b0_draft_hidden,
-                    node_ranks=node_ranks, node_block_slots=node_block_slots,
-                    retrieve_indices=retrieve_indices,
-                )
-
-            # === Decode Loop ===
-            eos_token_id = self.tokenizer.eos_token_id
-            while (cur_len - input_length) < max_new_tokens:
-                _nv_push(f"iter{iterations}")
-                # 1. Verify + Update + Draft in tight sequence
-                input_ids = input_ids_buf[:, :cur_len]
-                self._events_pool['target_start'][iterations].record()
-
-                _nv_push("target_verify")
-                (
-                    accept_length, accepted_token_ids, next_token,
-                    past_key_values, last_hidden_3h, lazy_hidden_3h,
-                    best_candidate, ret_indices, target_choices_cpu,
-                ) = self._tree_verify(
-                    draft_tokens, tree_mask, tree_position_ids, retrieve_indices,
-                    input_ids, past_key_values, temperature,
-                )
-                _nv_pop()
-
-                self._events_pool['target_end'][iterations].record()
-
-                # === OnlineAdapt hook: verify event (target responded) ===
-                if _adapt_hooks is not None:
-                    _adapt_hooks.on_verify(
-                        iteration=iterations,
-                        accept_length=int(accept_length.item()) if torch.is_tensor(accept_length) else int(accept_length),
-                        best_candidate=best_candidate, ret_indices=ret_indices,
-                        target_choices_cpu=target_choices_cpu,
-                        last_hidden_3h=last_hidden_3h, lazy_hidden_3h=lazy_hidden_3h,
-                        tree_logits_gpu=getattr(self, '_adapt_tree_logits_gpu', None),
-                        input_ids_buf=input_ids_buf,  # Phase 4D v15c: context for full-param training
-                        cur_len=cur_len,
-                    )
-
-                # 2. Update buffer (CPU work, minimal)
-                if accept_length > 0:
-                    input_ids_buf[0, cur_len:cur_len + accept_length] = accepted_token_ids
-                    cur_len += accept_length
-                input_ids_buf[0, cur_len] = next_token[0, 0]
-                cur_len += 1
-
-                # Online n-gram update: for each consecutive (a, b) → c pair in
-                # the tokens added this iter, increment table count. Uses last
-                # two tokens from input_ids_buf as context.
-                if self._ngram_cache_on and cur_len >= 3:
-                    # Pull new tokens (accepted + bonus) onto CPU once per iter
-                    _nt_end = cur_len
-                    _nt_start = max(0, cur_len - int(accept_length) - 1)  # start of this iter's writes
-                    # Include previous 2 tokens as context for first pair
-                    _ctx_start = max(0, _nt_start - 2)
-                    _seq = input_ids_buf[0, _ctx_start:_nt_end].tolist()
-                    for i in range(len(_seq) - 2):
-                        a, b, c = int(_seq[i]), int(_seq[i + 1]), int(_seq[i + 2])
-                        tbl = self._ngram_table.setdefault((a, b), {})
-                        tbl[c] = tbl.get(c, 0) + 1
-                    # Remember last 2 tokens for next iter's tree-build query
-                    if cur_len >= 2:
-                        self._ngram_prev2 = (int(input_ids_buf[0, cur_len - 2].item()),
-                                             int(input_ids_buf[0, cur_len - 1].item()))
-
-                # Defer coverage stats — both tensors use non_blocking transfers, no hot-path sync
-                draft_tokens_cpu = draft_tokens.to('cpu', non_blocking=True)
-                all_iter_bp_raw.append((node_block_slots, ret_indices, best_candidate, accept_length,
-                                        draft_tokens_cpu, target_choices_cpu))
-                accept_lengths_raw.append(accept_length)
-                all_iter_rank_stats.append(iter_rank_stats)
-                iterations += 1
-
-                # EOS check — no .item() sync, stay on GPU
-                if accept_length > 0:
-                    all_tokens = torch.cat([accepted_token_ids, next_token[0]])
-                else:
-                    all_tokens = next_token[0]
-                eos_flag = (all_tokens == eos_token_id).any()
-
-
-                # 3. Draft Phase: launch immediately, check EOS AFTER draft to overlap
-                self._events_pool['draft_start'][draft_events].record()
-
-                if accept_length == 0:
-                    # Nothing accepted: pop failed position, rebuild from scratch
-                    self.draft_model.pop_cache(draft_cache)
-                    draft_tokens, tree_mask, tree_position_ids, retrieve_indices, iter_rank_stats, node_ranks, node_block_slots = \
-                        self._build_draft_tree(
-                            last_hidden_3h, next_token,
-                            draft_cache, draft_position,
-                            temperature=temperature,
-                        )
-                else:
-                    # lazy_hidden_3h: [1, accept_length+1, 3H] (accepted + last)
-                    batch_h = lazy_hidden_3h  # [1, accept_length+1, 3H]
-
-                    # Tokens: shifted by 1 → [accepted_tokens[1:], next_token, next_token]
-                    if accept_length == 1:
-                        batch_tok = torch.cat([next_token, next_token], dim=1)  # [1, 2]
-                    else:
-                        batch_tok = torch.cat([
-                            accepted_token_ids[1:].unsqueeze(0),
-                            next_token, next_token
-                        ], dim=1)
-
-                    # Record per-block timing for block 0 (update_cache_and_draft)
-                    _blk0_starts[_blk0_count].record()
-
-                    _nv_push("update_cache_and_draft")
-                    _upd_out = None
-                    if (self._draft_graph_cache is not None
-                            and os.environ.get('DRAFT_CUDA_GRAPH_UPD', '0') == '1'):
-                        try:
-                            _upd_out = self._draft_graph_cache.run_update_cache(
-                                hidden_3h=batch_h,
-                                input_ids=batch_tok,
-                                draft_cache=draft_cache,
-                                start_position=draft_position + 1,
-                            )
-                        except Exception:
-                            _upd_out = None
-
-                    if _upd_out is not None:
-                        logits, rank_logits, draft_hidden, ttt_kv, draft_position = _upd_out
-                    else:
-                        logits, rank_logits, draft_hidden, ttt_kv, draft_position = \
-                            self.draft_model.update_cache_and_draft(
-                                batch_h, batch_tok, draft_cache, draft_position + 1
-                            )
-                    _nv_pop()
-
-                    _blk0_ends[_blk0_count].record()
-                    self._block_forward_events[0].append((_blk0_starts[_blk0_count], _blk0_ends[_blk0_count]))
-                    _blk0_count += 1
-
-                    _nv_push("build_tree")
-                    draft_tokens, tree_mask, tree_position_ids, retrieve_indices, iter_rank_stats, node_ranks, node_block_slots = \
-                        self._build_tree_from_block1_dispatch(
-                            logits, rank_logits, draft_hidden, ttt_kv,
-                            next_token, draft_cache, draft_position - 1,
-                            temperature=temperature,
-                        )
-                    _nv_pop()
-
-                    # === OnlineAdapt hook: tree just built (iter) ===
-                    if _adapt_hooks is not None:
-                        _adapt_hooks.on_tree_built(
-                            draft_tokens=draft_tokens, logits=logits,
-                            rank_logits=rank_logits, draft_hidden=draft_hidden,
-                            node_ranks=node_ranks, node_block_slots=node_block_slots,
-                            retrieve_indices=retrieve_indices,
-                        )
-
-                self._events_pool['draft_end'][draft_events].record()
-                draft_events += 1
-
-                current_token = next_token
-
-                # Check EOS after draft (eos_flag computed on GPU before draft, .item() overlaps)
-                _nv_pop()  # close iter
-                if eos_flag.item():
-                    break
-
-        # Compute timing (all CUDA events, same clock)
-        _wall_end_event.record()
-        torch.cuda.synchronize()
-
-        wall_time = _wall_start_event.elapsed_time(_wall_end_event) / 1000.0
-
-        prefill_time = self._events_pool['prefill_start'].elapsed_time(
-            self._events_pool['prefill_end']
-        ) / 1000.0
-
-        draft_time = sum(
-            self._events_pool['draft_start'][i].elapsed_time(self._events_pool['draft_end'][i])
-            for i in range(draft_events)
-        ) / 1000.0 if draft_events > 0 else 0.0
-
-        target_time = sum(
-            self._events_pool['target_start'][i].elapsed_time(self._events_pool['target_end'][i])
-            for i in range(iterations)
-        ) / 1000.0 if iterations > 0 else 0.0
-
-        other_time = max(0, wall_time - prefill_time - draft_time - target_time)
-
-        # Compute per-block forward times
-        draft_forward_times = {}
-        for depth, events in self._block_forward_events.items():
-            draft_forward_times[depth] = sum(
-                s.elapsed_time(e) for s, e in events
-            ) / 1000.0
-
-        output_ids = input_ids_buf[0, input_length:cur_len]
-        output_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
-        num_tokens = len(output_ids)
-
-        # Compute deferred coverage stats (all CPU work, after generation loop)
-        # Tensors from non_blocking transfers are guaranteed resolved after torch.cuda.synchronize() above
-        all_iter_block_pos_stats = [
-            self._compute_coverage_stats(dt, tc, ri, nbs)
-            for nbs, ri, bc, al, dt, tc in all_iter_bp_raw
-        ]
-
-        # Aggregate rank stats
-        rank_stats = self._aggregate_rank_stats(all_iter_rank_stats, accept_lengths_raw)
-        block_pos_stats = self._aggregate_block_pos_stats(all_iter_block_pos_stats)
-
-        # === OnlineAdapt hook: query end (routing decision + training) ===
-        # Expose CUDA-event-measured timing breakdown
-        # so hooks can size head batch by measured per-iter inference cost
-        # rather than wall_time / iterations rough estimate. prefill/draft/
-        # target/other already computed above (lines 4411-4427) using CUDA
-        # events; pass through so hooks.on_query_end's adaptive batch sizer
-        # has access to real per-iter target+draft GPU time.
-        if _adapt_hooks is not None:
-            _adapt_hooks.on_query_end(
-                accept_lengths_raw=list(accept_lengths_raw),
-                iterations=iterations, wall_time=wall_time,
-                input_length=input_length,
-                num_generated=num_tokens,
-                input_ids_full=input_ids_buf[0, :cur_len].detach().cpu().clone(),  # v16: full seq for full-step
-                prompt_len=input_length,
-                prefill_time=prefill_time,
-                draft_time=draft_time,
-                target_time=target_time,
-                other_time=other_time,
-            )
-
-        return {
-            "output": output_text,
-            "metrics": {
-                "total_tokens": num_tokens,
-                "wall_time": wall_time,
-                "tokens_per_second": num_tokens / wall_time if wall_time > 0 else 0,
-                "accept_length": self.compute_accept_length(accept_lengths_raw),
-                "iterations": iterations,
-                "accept_lengths_raw": accept_lengths_raw,
-                "prefill_time": prefill_time,
-                "draft_time": draft_time,
-                "target_time": target_time,
-                "other_time": other_time,
-                "draft_pct": draft_time / wall_time * 100 if wall_time > 0 else 0,
-                "target_pct": target_time / wall_time * 100 if wall_time > 0 else 0,
-                "draft_forward_times": draft_forward_times,
-                "tree_profile": getattr(self, '_last_tree_profile', {}),
-                "rank_stats": rank_stats,
-                "block_pos_stats": block_pos_stats,
-            }
-        }
+        """Generate B=1 through the same request-level batch core."""
+        return self.generate_conversations(
+            [conversation],
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            **kwargs,
+        )[0]
 
     def _generate_once_streaming(
         self,

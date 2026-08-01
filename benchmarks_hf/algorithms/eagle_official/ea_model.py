@@ -90,6 +90,8 @@ class EaModel(nn.Module):
                 'prefill_end': torch.cuda.Event(enable_timing=True),
                 'target_start': [torch.cuda.Event(enable_timing=True) for _ in range(self._events_pool_size)],
                 'target_end': [torch.cuda.Event(enable_timing=True) for _ in range(self._events_pool_size)],
+                'verify_start': [torch.cuda.Event(enable_timing=True) for _ in range(self._events_pool_size)],
+                'verify_end': [torch.cuda.Event(enable_timing=True) for _ in range(self._events_pool_size)],
                 'draft_start': [torch.cuda.Event(enable_timing=True) for _ in range(self._events_pool_size)],
                 'draft_end': [torch.cuda.Event(enable_timing=True) for _ in range(self._events_pool_size)],
             }
@@ -314,7 +316,7 @@ class EaModel(nn.Module):
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
                 break
-            if new_token > max_new_tokens:
+            if new_token >= max_new_tokens:
                 break
             if input_ids.shape[1] > max_length:
                 break
@@ -398,7 +400,6 @@ class EaModel(nn.Module):
         new_token = 0
         max_length = max_length - self.ea_layer.total_tokens - 10
         iterations = 0
-        all_depth_forward_events = []  # Collect per-depth events across all iterations
 
         for idx in range(max_length):
             self.base_model.model.tree_mask = tree_mask
@@ -418,12 +419,14 @@ class EaModel(nn.Module):
 
             self._events_pool['target_end'][iterations].record()
 
+            self._events_pool['verify_start'][iterations].record()
             draft_tokens = torch.cat((draft_tokens, padding), dim=1)
             candidates = draft_tokens[0, retrieve_indices]
 
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+            self._events_pool['verify_end'][iterations].record()
 
             # Convert tensor to int if needed
             if isinstance(accept_length, torch.Tensor):
@@ -451,10 +454,6 @@ class EaModel(nn.Module):
 
             self._events_pool['draft_end'][iterations].record()
 
-            # Collect per-depth events from this iteration's topK_genrate
-            if hasattr(self.ea_layer, '_depth_forward_events'):
-                all_depth_forward_events.extend(self.ea_layer._depth_forward_events)
-
             iterations += 1
 
             if is_llama3:
@@ -463,7 +462,7 @@ class EaModel(nn.Module):
 
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
                 break
-            if new_token > max_new_tokens:
+            if new_token >= max_new_tokens:
                 break
             if input_ids.shape[1] > max_length:
                 break
@@ -478,19 +477,15 @@ class EaModel(nn.Module):
                 self._events_pool['target_start'][i].elapsed_time(self._events_pool['target_end'][i])
                 for i in range(iterations)
             ) / 1000.0 if iterations > 0 else 0.0,
+            "verify_time": sum(
+                self._events_pool['verify_start'][i].elapsed_time(self._events_pool['verify_end'][i])
+                for i in range(iterations)
+            ) / 1000.0 if iterations > 0 else 0.0,
             "draft_time": sum(
                 self._events_pool['draft_start'][i].elapsed_time(self._events_pool['draft_end'][i])
                 for i in range(iterations)
             ) / 1000.0 if iterations > 0 else 0.0,
         }
-
-        # Collect per-depth draft forward times from all iterations
-        if all_depth_forward_events:
-            from collections import defaultdict
-            depth_times = defaultdict(float)
-            for depth, s, e in all_depth_forward_events:
-                depth_times[depth] += s.elapsed_time(e) / 1000.0
-            timing["draft_forward_times"] = dict(depth_times)
 
         return input_ids, new_token, iterations, timing, accept_lengths
 
@@ -556,7 +551,6 @@ class EaModel(nn.Module):
         max_length = max_length - self.ea_layer.total_tokens - 10
         iterations = 0
         start_time = time.time()
-        all_depth_forward_events = []  # Collect per-depth events across all iterations
 
         # Initialize CUDA events for timing
         max_iterations = max_new_tokens + 10
@@ -635,10 +629,6 @@ class EaModel(nn.Module):
 
             self._events_pool['draft_end'][iterations].record()
 
-            # Collect per-depth events from this iteration's topK_genrate
-            if hasattr(self.ea_layer, '_depth_forward_events'):
-                all_depth_forward_events.extend(self.ea_layer._depth_forward_events)
-
             # Get newly accepted tokens and bonus
             new_token_ids = input_ids[0, prev_len:].tolist()
             bonus_token_id = sample_token[0, 0].item()
@@ -672,7 +662,7 @@ class EaModel(nn.Module):
                 break
             if self.tokenizer.eos_token_id in input_ids[0, input_len:].tolist():
                 break
-            if new_token > max_new_tokens:
+            if new_token >= max_new_tokens:
                 break
             if input_ids.shape[1] > max_length:
                 break
@@ -688,15 +678,6 @@ class EaModel(nn.Module):
             for i in range(iterations)
         ) / 1000.0 if iterations > 0 else 0.0
 
-        # Collect per-depth draft forward times from all iterations
-        draft_forward_times = None
-        if all_depth_forward_events:
-            from collections import defaultdict
-            depth_times = defaultdict(float)
-            for depth, s, e in all_depth_forward_events:
-                depth_times[depth] += s.elapsed_time(e) / 1000.0
-            draft_forward_times = dict(depth_times)
-
         # Final yield
         yield {
             "final": True,
@@ -707,5 +688,4 @@ class EaModel(nn.Module):
             "elapsed_time": time.time() - start_time,
             "target_time": target_time,
             "draft_time": draft_time,
-            "draft_forward_times": draft_forward_times,
         }

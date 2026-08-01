@@ -68,11 +68,17 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
+        from sglang.srt.layers.attention.triton_ops.specblock_tree_verify_attention import (
+            specblock_tree_verify_attention_fwd,
+        )
 
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
+        self.specblock_tree_verify_attention_fwd = torch.compiler.disable(
+            specblock_tree_verify_attention_fwd
+        )
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
         )
@@ -86,6 +92,9 @@ class TritonAttnBackend(AttentionBackend):
         self.token_to_kv_pool_allocator = model_runner.token_to_kv_pool_allocator
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.use_specblock_tree_verify = (
+            model_runner.spec_algorithm.is_specblock_shift()
+        )
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
@@ -147,7 +156,6 @@ class TritonAttnBackend(AttentionBackend):
             )
         else:
             self.kv_indptr = kv_indptr_buf
-
         # If sliding window is enabled, we might need two sets of buffers
         # because of interleaved attention types (e.g. for Gemma3)
         self.window_kv_indptr = None
@@ -228,7 +236,6 @@ class TritonAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
-
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr
         window_kv_indptr = self.window_kv_indptr
@@ -339,12 +346,16 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
-            )
-            mask_indptr = self.mask_indptr
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-            mask_indptr = mask_indptr[: bs + 1]
+            mask_indptr = self.mask_indptr[: bs + 1]
+            if self.use_specblock_tree_verify:
+                mask_indptr.copy_(qo_indptr * self.num_draft_tokens)
+            else:
+                seq_mask_len = self.num_draft_tokens * (
+                    forward_batch.seq_lens + self.num_draft_tokens
+                )
+                mask_indptr[1 : bs + 1] = torch.cumsum(
+                    seq_mask_len[:bs], dim=0
+                )
             max_extend_len = self.num_draft_tokens
             num_kv_splits = None
             attn_logits = None
@@ -466,8 +477,13 @@ class TritonAttnBackend(AttentionBackend):
             self.cuda_graph_kv_indices = kv_indices_buf
 
         if not self.skip_prefill:
+            custom_mask_size = (
+                max_bs * self.num_draft_tokens * self.num_draft_tokens
+                if self.use_specblock_tree_verify
+                else max_num_tokens * self.max_context_len
+            )
             self.cuda_graph_custom_mask = torch.zeros(
-                (max_num_tokens * self.max_context_len),
+                custom_mask_size,
                 dtype=torch.uint8,
                 device=self.device,
             )
@@ -595,9 +611,14 @@ class TritonAttnBackend(AttentionBackend):
 
             custom_mask = self.cuda_graph_custom_mask
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            if self.use_specblock_tree_verify:
+                mask_indptr.copy_(qo_indptr * self.num_draft_tokens)
+            else:
+                seq_mask_len = self.num_draft_tokens * (
+                    seq_lens + self.num_draft_tokens
+                )
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
             max_extend_len = self.num_draft_tokens
             num_kv_splits = None
             attn_logits = None
@@ -706,7 +727,8 @@ class TritonAttnBackend(AttentionBackend):
             self.get_num_kv_splits(num_kv_splits[:num_token], seq_lens[:bs])
 
         elif forward_mode.is_target_verify():
-            # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr
+            # Update qo_indptr, kv_indptr, kv_indices, custom_mask, mask_indptr.
+            # SpecBlock and EAGLE share this grouped request-level verifier path.
             bs = len(req_pool_indices)
             qo_indptr = self.qo_indptr[: bs + 1]
             qo_indptr[: bs + 1] = torch.arange(
@@ -746,9 +768,14 @@ class TritonAttnBackend(AttentionBackend):
                 )
             custom_mask = self.cuda_graph_custom_mask
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
-            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+            if self.use_specblock_tree_verify:
+                mask_indptr.copy_(qo_indptr * self.num_draft_tokens)
+            else:
+                seq_mask_len = self.num_draft_tokens * (
+                    seq_lens + self.num_draft_tokens
+                )
+                mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         elif forward_mode.is_draft_extend(include_v2=True):
             seq_lens = seq_lens[:bs]
             accept_lens = spec_info.accept_length[:bs]
@@ -785,7 +812,45 @@ class TritonAttnBackend(AttentionBackend):
     def update_verify_buffers_to_fill_after_draft(
         self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
     ):
-        pass
+        """Refresh CUDA-graph verify mask after a plan/draft stream join.
+
+        ``replay_prepare`` can copy a tree mask while the speculative draft is
+        still producing it on the forward stream.  For the graph path, copy the
+        finalized source after that stream has been joined.  The non-graph path
+        keeps a direct reference to ``spec_info.custom_mask`` and needs no
+        repair.
+        """
+        if cuda_graph_bs is None or self.cuda_graph_custom_mask is None:
+            return
+        custom_mask = getattr(spec_info, "custom_mask", None)
+        if custom_mask is None:
+            return
+        if custom_mask.numel() > self.cuda_graph_custom_mask.numel():
+            raise RuntimeError(
+                "Target CUDA graph custom-mask buffer is too small for "
+                f"verification mask: source={custom_mask.numel()}, "
+                f"buffer={self.cuda_graph_custom_mask.numel()}."
+            )
+
+        # Clear inactive graph-capacity rows. Without this, a shrink after a
+        # larger batch can retain stale tree edges in the graph-owned buffer.
+        self.cuda_graph_custom_mask.zero_()
+        self.cuda_graph_custom_mask[: custom_mask.numel()].copy_(custom_mask)
+
+        # SpecBlock target verification uses a fixed query width per graph row.
+        # Rebuild the indptr against the active dynamic tree width, matching the
+        # target-verify CUDA-graph initialization path.
+        if self.use_specblock_tree_verify:
+            mask_indptr = self.mask_indptr[: cuda_graph_bs + 1]
+            mask_indptr.copy_(
+                torch.arange(
+                    cuda_graph_bs + 1,
+                    dtype=mask_indptr.dtype,
+                    device=mask_indptr.device,
+                )
+                * self.num_draft_tokens
+                * self.num_draft_tokens
+            )
 
     def forward_extend(
         self,
@@ -814,6 +879,37 @@ class TritonAttnBackend(AttentionBackend):
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
+
+        if (
+            self.use_specblock_tree_verify
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            if (
+                not causal
+                or logits_soft_cap != 0.0
+                or sinks is not None
+                or layer.sliding_window_size not in (None, -1)
+                or layer.xai_temperature_len not in (None, -1, 0)
+                or layer.qk_head_dim != layer.v_head_dim
+            ):
+                raise RuntimeError(
+                    "SpecBlock target verifier received an unsupported attention geometry."
+                )
+            self.specblock_tree_verify_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.kv_indptr,
+                self.forward_metadata.kv_indices,
+                self.forward_metadata.custom_mask,
+                self.forward_metadata.mask_indptr,
+                self.num_draft_tokens,
+                layer.scaling,
+            )
+            return o
 
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:

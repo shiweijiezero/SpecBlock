@@ -639,6 +639,7 @@ def _bfs_scatter_kernel_flat(
     pend_cum_lps_ptr,          # [B, PEND_MAX] f32 (batched buffer view)
     pend_node_indices_ptr,     # [B, PEND_MAX] i64 (batched buffer view)
     slot_topks_NK_ptr,         # [sum_N*K] i64
+    valid_leaf_ptr,            # [sum_N] bool
 
     bidx_per_leaf_ptr,         # [sum_N] i64 — original req index (0..B-1)
     leaf_local_ptr,            # [sum_N] i64 — leaf index within its req
@@ -670,6 +671,7 @@ def _bfs_scatter_kernel_flat(
     pid = tl.program_id(0)
     slot_vec = tl.arange(0, K)
 
+    leaf_valid = tl.load(valid_leaf_ptr + pid).to(tl.int1)
     bidx = tl.load(bidx_per_leaf_ptr + pid).to(tl.int64)
     leaf_local = tl.load(leaf_local_ptr + pid).to(tl.int64)
     tree_start = tl.load(tree_start_per_req_ptr + bidx).to(tl.int64)
@@ -694,12 +696,21 @@ def _bfs_scatter_kernel_flat(
     parent_vec = tl.where(slot_vec == 0, pend_node, chain_pos_local - 1)
     lp_vec = pend_cum_lp + cum_greedy_lps
 
-    tl.store(tree_tokens_ptr  + chain_pos_global, greedy_tgt)
-    tl.store(tree_parents_ptr + chain_pos_global, parent_vec)
-    tl.store(tree_lps_ptr     + chain_pos_global, lp_vec)
-    tl.store(tree_ranks_ptr   + chain_pos_global, rank_vec)
-    tl.store(tree_blocks_ptr  + chain_pos_global, tl.full([K], PEND_DEPTH, dtype=tl.int64))
-    tl.store(tree_slots_ptr   + chain_pos_global, slot_vec.to(tl.int64))
+    chain_mask = (slot_vec >= 0) & leaf_valid
+    tl.store(tree_tokens_ptr  + chain_pos_global, greedy_tgt, mask=chain_mask)
+    tl.store(tree_parents_ptr + chain_pos_global, parent_vec, mask=chain_mask)
+    tl.store(tree_lps_ptr     + chain_pos_global, lp_vec, mask=chain_mask)
+    tl.store(tree_ranks_ptr   + chain_pos_global, rank_vec, mask=chain_mask)
+    tl.store(
+        tree_blocks_ptr + chain_pos_global,
+        tl.full([K], PEND_DEPTH, dtype=tl.int64),
+        mask=chain_mask,
+    )
+    tl.store(
+        tree_slots_ptr + chain_pos_global,
+        slot_vec.to(tl.int64),
+        mask=chain_mask,
+    )
 
     slot_topks = tl.load(slot_topks_NK_ptr + pid * K + slot_vec)
     is_active = slot_topks > 1
@@ -713,7 +724,8 @@ def _bfs_scatter_kernel_flat(
     j_real = j_vec < J_COUNT
 
     valid_2d = (
-        is_active[:, None]
+        leaf_valid
+        & is_active[:, None]
         & j_real[None, :]
         & (j_val[None, :] < slot_topks[:, None])
     )
@@ -899,6 +911,88 @@ def _tree_retrieve_kernel(
         valid = (d <= leaf_depth) & (col >= 0)
         tl.store(ri_ptr + lid * (max_depth + 1) + tl.where(valid, col, 0), cur, mask=valid)
         parent = tl.load(parent_ptr + cur)
+        cur = tl.where(cur > 0, parent, cur)
+
+
+# =============================================================================
+#   Batched depth+mask / retrieve kernels (S3c)
+# =============================================================================
+
+@triton.jit
+def _tree_depth_mask_kernel_batched(
+    parent_ptr,        # [B, MAX_NP1] i32 (padded with 0 self-root for pad slots)
+    depth_ptr,         # [B, MAX_NP1] i32
+    mask_ptr,          # [B, MAX_NP1, MAX_NP1] f32 (zero-init'd by caller)
+    MAX_NP1,           # row stride for parent/depth
+    MASK_STRIDE,       # row stride for mask = MAX_NP1 * MAX_NP1
+    MAX_DEPTH: tl.constexpr,
+):
+    """grid=(B, MAX_NP1) batched depth+ancestor-mask walk.
+
+    Same per-node logic as ``_tree_depth_mask_kernel``; bidx routes the
+    per-req row of the [B, MAX_NP1] / [B, MAX_NP1, MAX_NP1] buffers.
+    Pad slots (pid >= Np1_b for req b) are stored with parent=0 by caller,
+    so their walk terminates after one step writing mask[pad, 0] and
+    mask[pad, pad]; these rows are sliced away in the per-req output dict.
+    """
+    bidx = tl.program_id(0)
+    pid = tl.program_id(1)
+
+    bP = bidx * MAX_NP1
+    bM = bidx * MASK_STRIDE
+
+    cur = pid
+    depth = 0
+    for _ in range(MAX_DEPTH + 1):
+        tl.store(mask_ptr + bM + pid * MAX_NP1 + cur, 1.0)
+        parent = tl.load(parent_ptr + bP + cur)
+        is_root = cur == 0
+        depth += tl.where(is_root, 0, 1)
+        cur = tl.where(is_root, 0, parent)
+
+    tl.store(depth_ptr + bP + pid, depth)
+
+
+@triton.jit
+def _tree_retrieve_kernel_batched(
+    parent_ptr,        # [B, MAX_NP1] i32
+    depth_ptr,         # [B, MAX_NP1] i32
+    leaves_ptr,        # [B, MAX_NP1] i32 (padded with MAX_NP1 sentinel)
+    num_leaves_ptr,    # [B] i32 — per-req real leaf count
+    ri_ptr,            # [B, MAX_NP1, max_depth+1] i32 (-1 pre-filled)
+    max_depth,
+    MAX_NP1,
+    RI_STRIDE,         # = MAX_NP1 * (max_depth+1)
+    MAX_DEPTH: tl.constexpr,
+):
+    """grid=(B, MAX_NP1) batched retrieve.  Each program at (bidx, lid)
+    builds the root->leaf path for the lid-th leaf of req bidx.  Gated by
+    ``lid < num_leaves[bidx]`` so over-allocated lid slots no-op.
+    """
+    bidx = tl.program_id(0)
+    lid = tl.program_id(1)
+
+    nl = tl.load(num_leaves_ptr + bidx)
+    if lid >= nl:
+        return
+
+    bP = bidx * MAX_NP1
+    bL = bidx * MAX_NP1
+    bRI = bidx * RI_STRIDE
+
+    leaf = tl.load(leaves_ptr + bL + lid)
+    leaf_depth = tl.load(depth_ptr + bP + leaf)
+
+    cur = leaf
+    for d in range(MAX_DEPTH + 1):
+        col = leaf_depth - d
+        valid = (d <= leaf_depth) & (col >= 0)
+        tl.store(
+            ri_ptr + bRI + lid * (max_depth + 1) + tl.where(valid, col, 0),
+            cur,
+            mask=valid,
+        )
+        parent = tl.load(parent_ptr + bP + cur)
         cur = tl.where(cur > 0, parent, cur)
 
 
@@ -1107,6 +1201,7 @@ def triton_build_bfs_flat_batched(
     total_alts_per_req_b.scatter_add_(0, bidx_per_leaf_t, n_alt_per_leaf)
 
     # ---- Single flat scatter kernel launch.
+    valid_leaf = torch.ones(sum_N, dtype=torch.bool, device=device)
     _bfs_scatter_kernel_flat[(sum_N,)](
         all_rank_preds_full.to(torch.int64).contiguous(),
         all_greedy_target_full.to(torch.int64).contiguous(),
@@ -1116,6 +1211,7 @@ def triton_build_bfs_flat_batched(
         pend_buf_b['cum_lps'],
         pend_buf_b['node_indices'],
         slot_topks_NK_full.reshape(-1).contiguous(),
+        valid_leaf,
         bidx_per_leaf_t.contiguous(),
         leaf_local_t.contiguous(),
         n_nodes_b1_b.contiguous(),
@@ -1132,6 +1228,75 @@ def triton_build_bfs_flat_batched(
     )
 
     return total_alts_per_req_b  # [B] gpu long
+
+
+def triton_build_bfs_fixed_batched(
+    all_rank_preds: torch.Tensor,
+    all_greedy_target: torch.Tensor,
+    all_greedy_lps: torch.Tensor,
+    top_target_all: torch.Tensor,
+    top_lps_all: torch.Tensor,
+    slot_topks: torch.Tensor,
+    valid_leaf_b: torch.Tensor,
+    pend_buf_b: dict,
+    tree_buf_b: dict,
+    sizes4_b: torch.Tensor,
+    *,
+    B: int,
+    pend_bucket: int,
+    K: int,
+    max_topk: int,
+    rank_classes: int,
+    give_up_class: int,
+    max_nodes: int,
+) -> torch.Tensor:
+    """Scatter fixed ``[B, P]`` pending rows without compacting or host sync."""
+    total_rows = B * pend_bucket
+    device = valid_leaf_b.device
+    flat_valid = valid_leaf_b.reshape(total_rows)
+    bidx = (
+        torch.arange(B, device=device, dtype=torch.long)
+        .unsqueeze(1)
+        .expand(B, pend_bucket)
+        .reshape(total_rows)
+    )
+    leaf_local = (
+        torch.arange(pend_bucket, device=device, dtype=torch.long)
+        .unsqueeze(0)
+        .expand(B, pend_bucket)
+        .reshape(total_rows)
+    )
+
+    slot_topks_b = slot_topks.reshape(B, pend_bucket, K)
+    n_alt_per_leaf = (slot_topks_b - 1).clamp(min=0).sum(dim=2)
+    n_alt_per_leaf = torch.where(
+        valid_leaf_b, n_alt_per_leaf, torch.zeros_like(n_alt_per_leaf)
+    )
+    cum_alt_incl = n_alt_per_leaf.cumsum(dim=1)
+    cum_alt_excl = cum_alt_incl - n_alt_per_leaf
+    total_alts = cum_alt_incl[:, -1]
+
+    tree_start = sizes4_b[:, 0].contiguous()
+    n_pend = sizes4_b[:, 3].contiguous()
+    alt_base = (tree_start + n_pend * K).contiguous()
+
+    _bfs_scatter_kernel_flat[(total_rows,)](
+        all_rank_preds.to(torch.int64).contiguous(),
+        all_greedy_target.to(torch.int64).contiguous(),
+        all_greedy_lps.to(torch.float32).contiguous(),
+        top_target_all.to(torch.int64).contiguous(),
+        top_lps_all.to(torch.float32).contiguous(),
+        pend_buf_b["cum_lps"], pend_buf_b["node_indices"],
+        slot_topks.reshape(-1).contiguous(), flat_valid.contiguous(),
+        bidx.contiguous(), leaf_local.contiguous(),
+        tree_start, alt_base, cum_alt_excl.reshape(-1).contiguous(),
+        tree_buf_b["tokens"], tree_buf_b["parents"], tree_buf_b["lps"],
+        tree_buf_b["ranks"], tree_buf_b["blocks"], tree_buf_b["slots"],
+        max_nodes, pend_bucket,
+        K=K, MAX_TOPK=max_topk, RANK_CLASSES=rank_classes,
+        GIVE_UP_CLASS=give_up_class, PEND_DEPTH=1, J_PAD=16,
+    )
+    return total_alts
 
 
 def triton_build_bfs(
@@ -1186,6 +1351,693 @@ def triton_build_bfs(
 # =============================================================================
 #   Prune (top-K + ancestor closure)
 # =============================================================================
+
+def gpu_prune_tree_batched(
+    tree_buf_b: dict,
+    n_nodes_per_req: List[int],
+    prune_rows: List[int],
+    budget: int,
+) -> dict:
+    """Prune several trees with one set of batched PyTorch kernels.
+
+    Cumulative log-probability is monotone along every tree edge because each
+    child adds a non-positive token log-probability.  Therefore the top-k nodes
+    are already ancestor-closed; sorting their original indices reproduces the
+    compact order of :func:`gpu_prune_tree` without per-request closure kernels.
+    """
+    device = tree_buf_b['tokens'].device
+    num_pruned = len(prune_rows)
+    if num_pruned == 0:
+        return {}
+
+    max_n = max(n_nodes_per_req[row] for row in prune_rows)
+    all_rows = prune_rows == list(range(len(n_nodes_per_req)))
+    row_index = None if all_rows else torch.tensor(
+        prune_rows, dtype=torch.long, device=device,
+    )
+    row_n = torch.tensor(
+        [n_nodes_per_req[row] for row in prune_rows],
+        dtype=torch.long, device=device,
+    )
+    arange_n = torch.arange(max_n, device=device).unsqueeze(0)
+    valid = arange_n < row_n.unsqueeze(1)
+
+    def select_rows(name: str) -> torch.Tensor:
+        src = tree_buf_b[name]
+        if all_rows:
+            return src[:num_pruned, :max_n]
+        return src.index_select(0, row_index)[:, :max_n]
+
+    lps = select_rows('lps')
+    scores = torch.where(valid, lps, torch.full_like(lps, float('-inf')))
+    top_idx = torch.topk(scores, budget, dim=1, largest=True).indices
+    kept_idx = top_idx.sort(dim=1).values
+
+    old_to_new = torch.full(
+        (num_pruned, max_n), -1, dtype=torch.long, device=device,
+    )
+    compact_idx = torch.arange(budget, device=device).unsqueeze(0).expand(
+        num_pruned, -1,
+    )
+    old_to_new.scatter_(1, kept_idx, compact_idx)
+
+    def gather_field(name: str) -> torch.Tensor:
+        return torch.gather(select_rows(name), 1, kept_idx)
+
+    old_parents = gather_field('parents')
+    parent_new_pos = torch.gather(old_to_new, 1, old_parents.clamp(min=0))
+    new_parents = torch.where(
+        old_parents >= 0,
+        parent_new_pos,
+        torch.full_like(old_parents, -1),
+    )
+
+    return {
+        'tokens': gather_field('tokens'),
+        'parents': new_parents,
+        'lps': gather_field('lps'),
+        'ranks': gather_field('ranks'),
+        'blocks': gather_field('blocks'),
+        'slots': gather_field('slots'),
+    }
+
+
+@triton.jit
+def _dedup_tree_rows_by_depth_kernel(
+    tokens_ptr,
+    parents_ptr,
+    lps_ptr,
+    raw_n_ptr,
+    compact_packed_buf_ptr,
+    combined_winner_buf_ptr,
+    node_state_buf_ptr,
+    stride_raw: tl.constexpr,
+    stride_compact: tl.constexpr,
+    N: tl.constexpr,
+    COMPACT_N: tl.constexpr,
+    MAX_DEDUP_DEPTH: tl.constexpr,
+    MAX_WALK_DEPTH: tl.constexpr,
+):
+    """Merge duplicate semantic paths with compact per-depth sorts."""
+    bidx = tl.program_id(0)
+    raw_base = bidx * stride_raw
+    compact_base = bidx * stride_compact
+    n = tl.load(raw_n_ptr + bidx)
+    pid = tl.arange(0, N)
+    compact_pid = tl.arange(0, COMPACT_N)
+    valid = pid < n
+
+    tokens = tl.load(
+        tokens_ptr + raw_base + pid,
+        mask=valid,
+        other=0,
+    ).to(tl.int64)
+    parents = tl.load(
+        parents_ptr + raw_base + pid,
+        mask=valid,
+        other=-1,
+    ).to(tl.int64)
+
+    # Raw nodes are topologically ordered.  Static depth remains valid while
+    # same-depth losers are redirected to the winner under the same parent.
+    cur = pid.to(tl.int64)
+    depths = tl.zeros([N], dtype=tl.int32)
+    for _ in range(MAX_WALK_DEPTH):
+        cur_parent = tl.load(
+            parents_ptr + raw_base + cur,
+            mask=valid,
+            other=-1,
+        ).to(tl.int64)
+        has_parent = cur_parent >= 0
+        depths += has_parent.to(tl.int32)
+        cur = tl.where(has_parent, cur_parent, cur)
+
+    key_shift = tl.cast(1 << 32, tl.int64)
+    nplus = tl.cast(N + 1, tl.int64)
+    sentinel_packed = tl.cast(1 << 62, tl.int64)
+    sentinel_key = tl.cast(-1, tl.int64)
+    xor_ffff = tl.cast(0xFFFFFFFF, tl.int64)
+    low_mask = tl.cast(0xFFFFFFFF, tl.int64)
+    mask_shift = tl.cast(32, tl.int64)
+
+    # Compact each depth before sorting.  The production W90 geometry has at
+    # most 170 nodes at any depth, so a 256-lane sort replaces eight 1024-lane
+    # sorts without changing winner selection or parent canonicalization.
+    for target_d in tl.static_range(1, MAX_DEDUP_DEPTH + 1):
+        lps = tl.load(
+            lps_ptr + raw_base + pid,
+            mask=valid,
+            other=float("-inf"),
+        )
+        is_at_d = (depths == target_d) & valid & (lps != float("-inf"))
+        compact_rank = tl.cumsum(is_at_d.to(tl.int32), axis=0) - 1
+        n_at_d = tl.sum(is_at_d.to(tl.int32), axis=0)
+
+        tl.store(
+            compact_packed_buf_ptr + compact_base + compact_pid,
+            tl.full([COMPACT_N], sentinel_packed, tl.int64),
+        )
+        tl.store(
+            combined_winner_buf_ptr + compact_base + compact_pid,
+            tl.zeros([COMPACT_N], tl.int64),
+        )
+        tl.store(
+            node_state_buf_ptr + raw_base + pid,
+            tl.zeros([N], tl.int64),
+        )
+        tl.debug_barrier()
+
+        keys = (parents + 1) * key_shift + tokens
+        packed = keys * nplus + pid.to(tl.int64)
+        tl.store(
+            compact_packed_buf_ptr + compact_base + compact_rank,
+            packed,
+            mask=is_at_d,
+        )
+        tl.debug_barrier()
+
+        compact_packed = tl.load(
+            compact_packed_buf_ptr + compact_base + compact_pid,
+        )
+        sorted_packed = tl.sort(compact_packed)
+        sorted_raw_pid = sorted_packed % nplus
+        sorted_keys = sorted_packed // nplus
+        sorted_valid = compact_pid < n_at_d
+
+        tl.store(
+            compact_packed_buf_ptr + compact_base + compact_pid,
+            sorted_keys,
+        )
+        tl.debug_barrier()
+        sorted_keys_prev = tl.load(
+            compact_packed_buf_ptr + compact_base + compact_pid - 1,
+            mask=(compact_pid > 0) & sorted_valid,
+            other=sentinel_key,
+        )
+        is_first = (sorted_keys != sorted_keys_prev) & sorted_valid
+        group_id = (
+            tl.cumsum(is_first.to(tl.int32), 0) - 1
+        ).to(tl.int64)
+
+        sorted_lps = tl.load(
+            lps_ptr + raw_base + sorted_raw_pid,
+            mask=sorted_valid,
+            other=float("-inf"),
+        )
+        lps_bits = (
+            sorted_lps.to(tl.int32, bitcast=True).to(tl.int64) & low_mask
+        )
+        encoded_lp = lps_bits ^ xor_ffff
+        pid_inv = (sorted_raw_pid ^ xor_ffff) & low_mask
+        combined = (encoded_lp << 32) | pid_inv
+        tl.atomic_max(
+            combined_winner_buf_ptr + compact_base + group_id,
+            combined,
+            mask=sorted_valid,
+        )
+        tl.debug_barrier()
+        winner_combined = tl.load(
+            combined_winner_buf_ptr + compact_base + group_id,
+            mask=sorted_valid,
+            other=0,
+        ).to(tl.int64)
+        winner_pid = (winner_combined & low_mask) ^ xor_ffff
+        to_mask = sorted_valid & (combined != winner_combined)
+        node_state = (
+            to_mask.to(tl.int64) << mask_shift
+        ) | (winner_pid & low_mask)
+        tl.store(
+            node_state_buf_ptr + raw_base + sorted_raw_pid,
+            node_state,
+            mask=sorted_valid,
+        )
+        tl.store(
+            lps_ptr + raw_base + sorted_raw_pid,
+            float("-inf"),
+            mask=to_mask,
+        )
+        tl.debug_barrier()
+
+        parents_clamped = tl.maximum(parents, 0)
+        parent_state = tl.load(
+            node_state_buf_ptr + raw_base + parents_clamped,
+            mask=valid,
+            other=0,
+        ).to(tl.int64)
+        parent_is_masked = (parent_state >> mask_shift) != 0
+        parent_winner = parent_state & low_mask
+        parents = tl.where(
+            (parents >= 0) & parent_is_masked,
+            parent_winner,
+            parents,
+        )
+
+    tl.store(parents_ptr + raw_base + pid, parents, mask=valid)
+
+
+@triton.jit
+def _finalize_one_block_fixed_kernel(
+    raw_tokens_ptr,
+    raw_parents_ptr,
+    raw_lps_ptr,
+    kept_idx_ptr,
+    kept_valid_ptr,
+    sample_tokens_ptr,
+    seq_lens_ptr,
+    out_tokens_ptr,
+    out_parents_ptr,
+    out_topo_parents_ptr,
+    out_lps_ptr,
+    out_depth_ptr,
+    out_positions_ptr,
+    out_mask_ptr,
+    out_retrieve_index_ptr,
+    out_next_token_ptr,
+    out_next_sibling_ptr,
+    stride_raw: tl.constexpr,
+    stride_kept: tl.constexpr,
+    stride_out: tl.constexpr,
+    stride_mask: tl.constexpr,
+    N: tl.constexpr,
+    BUDGET: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MAX_DEPTH: tl.constexpr,
+):
+    """Pack a pruned one-block tree and build topology in one program/request."""
+    bidx = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_N)
+    nonroot = offs - 1
+    is_root = offs == 0
+    in_tree = offs < N
+    is_nonroot = (offs > 0) & in_tree
+
+    kept = tl.load(
+        kept_idx_ptr + bidx * stride_kept + nonroot,
+        mask=is_nonroot,
+        other=0,
+    ).to(tl.int64)
+    kept_valid = tl.load(
+        kept_valid_ptr + bidx * stride_kept + nonroot,
+        mask=is_nonroot,
+        other=0,
+    ).to(tl.int1)
+    node_valid = is_root | (is_nonroot & kept_valid)
+
+    old_parent = tl.load(
+        raw_parents_ptr + bidx * stride_raw + kept,
+        mask=is_nonroot & kept_valid,
+        other=-1,
+    ).to(tl.int64)
+
+    # Map raw parent indices to compact non-root indices.  Top-k cumulative
+    # probability is ancestor-closed, so every non-root parent has one match.
+    cand = tl.arange(0, BLOCK_N)
+    cand_valid = cand < BUDGET
+    cand_old = tl.load(
+        kept_idx_ptr + bidx * stride_kept + cand,
+        mask=cand_valid,
+        other=-2,
+    ).to(tl.int64)
+    cand_keep = tl.load(
+        kept_valid_ptr + bidx * stride_kept + cand,
+        mask=cand_valid,
+        other=0,
+    ).to(tl.int1)
+    parent_match = (
+        old_parent[:, None] == cand_old[None, :]
+    ) & cand_keep[None, :] & is_nonroot[:, None] & kept_valid[:, None]
+    mapped_parent = tl.max(
+        tl.where(parent_match, cand[None, :], -1), axis=1,
+    ).to(tl.int64)
+    raw_parent_out = tl.where(
+        is_root,
+        -1,
+        tl.where(
+            kept_valid,
+            tl.where(old_parent >= 0, mapped_parent, -1),
+            -2,
+        ),
+    )
+
+    sample = tl.load(sample_tokens_ptr + bidx)
+    raw_token = tl.load(
+        raw_tokens_ptr + bidx * stride_raw + kept,
+        mask=is_nonroot & kept_valid,
+        other=0,
+    )
+    raw_lp = tl.load(
+        raw_lps_ptr + bidx * stride_raw + kept,
+        mask=is_nonroot & kept_valid,
+        other=float("-inf"),
+    )
+    tl.store(
+        out_tokens_ptr + bidx * stride_out + offs,
+        tl.where(is_root, sample, raw_token),
+        mask=in_tree,
+    )
+    tl.store(
+        out_parents_ptr + bidx * stride_out + offs,
+        raw_parent_out,
+        mask=in_tree,
+    )
+    tl.store(
+        out_lps_ptr + bidx * stride_out + offs,
+        tl.where(is_root, 0.0, raw_lp),
+        mask=in_tree,
+    )
+
+    # Depth follows raw parent links directly, avoiding an intermediate
+    # old-to-new mapping tensor.
+    cur_old = kept
+    active = is_nonroot & kept_valid
+    depth = tl.zeros((BLOCK_N,), dtype=tl.int64)
+    for _ in tl.static_range(0, MAX_DEPTH):
+        depth += active.to(tl.int64)
+        parent_old = tl.load(
+            raw_parents_ptr + bidx * stride_raw + cur_old,
+            mask=active,
+            other=-1,
+        ).to(tl.int64)
+        active = active & (parent_old >= 0)
+        cur_old = tl.where(active, parent_old, cur_old)
+    tl.store(
+        out_depth_ptr + bidx * stride_out + offs,
+        depth,
+        mask=in_tree,
+    )
+
+    # Ancestor mask.  Invalid padded nodes attend only to themselves so the
+    # target attention row stays finite, but no topology link can reach them.
+    mask_offs = tl.arange(0, BLOCK_N * BLOCK_N)
+    q = mask_offs // N
+    k = mask_offs - q * N
+    mask_in = (q < N) & (k < N)
+    q_nonroot = q - 1
+    q_is_root = q == 0
+    q_kept = tl.load(
+        kept_idx_ptr + bidx * stride_kept + q_nonroot,
+        mask=(q > 0) & (q < N),
+        other=0,
+    ).to(tl.int64)
+    q_valid = tl.load(
+        kept_valid_ptr + bidx * stride_kept + q_nonroot,
+        mask=(q > 0) & (q < N),
+        other=0,
+    ).to(tl.int1)
+    k_old = tl.load(
+        kept_idx_ptr + bidx * stride_kept + (k - 1),
+        mask=(k > 0) & (k < N),
+        other=-2,
+    ).to(tl.int64)
+    visible = (q_is_root & (k == 0)) | ((q > 0) & ~q_valid & (k == q))
+    visible |= (q > 0) & q_valid & (k == 0)
+    cur_q_old = q_kept
+    q_active = (q > 0) & q_valid
+    for _ in tl.static_range(0, MAX_DEPTH):
+        visible |= q_active & (k > 0) & (k_old == cur_q_old)
+        parent_old = tl.load(
+            raw_parents_ptr + bidx * stride_raw + cur_q_old,
+            mask=q_active,
+            other=-1,
+        ).to(tl.int64)
+        q_active = q_active & (parent_old >= 0)
+        cur_q_old = tl.where(q_active, parent_old, cur_q_old)
+    tl.store(
+        out_mask_ptr + bidx * stride_mask + mask_offs,
+        visible.to(tl.float32),
+        mask=mask_in,
+    )
+
+    # First-child and next-sibling links in topology coordinates (root=0).
+    topo_parent = tl.where(
+        is_nonroot & kept_valid,
+        tl.where(raw_parent_out >= 0, raw_parent_out + 1, 0),
+        -1,
+    )
+    seq_len = tl.load(seq_lens_ptr + bidx).to(tl.int64)
+    tl.store(
+        out_topo_parents_ptr + bidx * stride_out + offs,
+        topo_parent,
+        mask=in_tree,
+    )
+    tl.store(
+        out_positions_ptr + bidx * stride_out + offs,
+        depth + seq_len,
+        mask=in_tree,
+    )
+    tl.store(
+        out_retrieve_index_ptr + bidx * stride_out + offs,
+        offs + bidx * N,
+        mask=in_tree,
+    )
+    node_idx = offs
+    child_match = (
+        (node_idx[None, :] > 0)
+        & node_valid[None, :]
+        & (topo_parent[None, :] == offs[:, None])
+    )
+    inf = N + 1
+    next_token = tl.min(
+        tl.where(child_match, node_idx[None, :], inf), axis=1,
+    )
+    sibling_match = (
+        (node_idx[None, :] > offs[:, None])
+        & node_valid[None, :]
+        & is_nonroot[:, None]
+        & kept_valid[:, None]
+        & (topo_parent[None, :] == topo_parent[:, None])
+    )
+    next_sibling = tl.min(
+        tl.where(sibling_match, node_idx[None, :], inf), axis=1,
+    )
+    next_token = tl.where(next_token < inf, next_token, -1)
+    next_sibling = tl.where(next_sibling < inf, next_sibling, -1)
+    tl.store(
+        out_next_token_ptr + bidx * stride_out + offs,
+        next_token,
+        mask=in_tree,
+    )
+    tl.store(
+        out_next_sibling_ptr + bidx * stride_out + offs,
+        next_sibling,
+        mask=in_tree,
+    )
+
+
+def finalize_one_block_fixed_batched(
+    tree_buf_b: dict,
+    raw_sizes_b: torch.Tensor,
+    sample_tokens_b: torch.Tensor,
+    budget: int,
+    raw_capacity: int,
+    sb_batch: dict,
+    active_bs: Optional[int] = None,
+    dedup_depth: int = 4,
+    seq_lens_b: Optional[torch.Tensor] = None,
+) -> list:
+    """Finalize fixed-width trees without host metadata synchronization."""
+    device = tree_buf_b["tokens"].device
+    B = int(sample_tokens_b.shape[0])
+    if active_bs is None:
+        active_bs = B
+    if not 0 < active_bs <= B:
+        raise RuntimeError(
+            f"Invalid active batch {active_bs} for tree capacity {B}."
+        )
+    N = budget + 1
+    raw_n = (
+        raw_sizes_b[:B, 0] if raw_sizes_b.dim() > 1 else raw_sizes_b[:B]
+    ).long()
+    if seq_lens_b is None:
+        zero_seq_lens = sb_batch.get("zero_seq_lens")
+        if zero_seq_lens is None or zero_seq_lens.shape[0] < B:
+            zero_seq_lens = torch.zeros(B, dtype=torch.long, device=device)
+            sb_batch["zero_seq_lens"] = zero_seq_lens
+        seq_lens_b = zero_seq_lens[:B]
+    elif seq_lens_b.shape != (B,):
+        raise RuntimeError(
+            f"Invalid fixed-tree seq_lens shape {tuple(seq_lens_b.shape)} for B={B}."
+        )
+    if not 0 < dedup_depth <= MAX_TREE_DEPTH:
+        raise RuntimeError(f"Invalid SpecBlock dedup depth {dedup_depth}.")
+
+    # The HF production builder merges the same block-1/block-2 collisions
+    # before pruning.  Apply the equivalent depth-ordered merge to every
+    # request row: the highest-score duplicate survives, its children are
+    # redirected to that survivor, and the freed W90 slots are refilled by
+    # the next highest-score unique paths.
+    dedup_block_n = triton.next_power_of_2(raw_capacity)
+    # Exact fixed B1 W90 geometry uses an 89-node non-root budget and a
+    # 769-node raw buffer: one block-1 tree plus 16 expanded roots, each
+    # contributing at most top-k=10 nodes at a depth. Including block 1, the
+    # structural depth width is <= 17 * 10 = 170, rounded to 256 lanes.
+    # Other geometries retain their full raw width.
+    dedup_compact_n = (
+        256
+        if budget == 89 and raw_capacity == 769 and dedup_depth == 8
+        else dedup_block_n
+    )
+    dedup_scratch = sb_batch.get("dedup_scratch")
+    dedup_shape = (B, dedup_block_n, dedup_compact_n)
+    if dedup_scratch is None or dedup_scratch["shape"] != dedup_shape:
+        dedup_scratch = {
+            "shape": dedup_shape,
+            "compact_packed": torch.empty(
+                (B, dedup_compact_n), dtype=torch.long, device=device,
+            ),
+            "combined_winner": torch.empty(
+                (B, dedup_compact_n), dtype=torch.long, device=device,
+            ),
+            "node_state": torch.empty(
+                (B, dedup_block_n), dtype=torch.long, device=device,
+            ),
+        }
+        sb_batch["dedup_scratch"] = dedup_scratch
+    _dedup_tree_rows_by_depth_kernel[(B,)](
+        tree_buf_b["tokens"],
+        tree_buf_b["parents"],
+        tree_buf_b["lps"],
+        raw_n,
+        dedup_scratch["compact_packed"],
+        dedup_scratch["combined_winner"],
+        dedup_scratch["node_state"],
+        tree_buf_b["tokens"].shape[1],
+        dedup_compact_n,
+        N=dedup_block_n,
+        COMPACT_N=dedup_compact_n,
+        MAX_DEDUP_DEPTH=dedup_depth,
+        MAX_WALK_DEPTH=MAX_TREE_DEPTH,
+        num_warps=4,
+    )
+
+    score_width = max(raw_capacity, budget)
+    raw_lps = tree_buf_b["lps"][:B, :raw_capacity]
+    if score_width > raw_capacity:
+        scores = F.pad(
+            raw_lps,
+            (0, score_width - raw_capacity),
+            value=float("-inf"),
+        )
+    else:
+        scores = raw_lps
+    valid_raw = (
+        torch.arange(score_width, device=device).unsqueeze(0)
+        < raw_n.unsqueeze(1)
+    )
+    scores = torch.where(
+        valid_raw, scores, torch.full_like(scores, float("-inf")),
+    )
+    kept_idx = torch.topk(scores, budget, dim=1, largest=True).indices
+    kept_idx = kept_idx.sort(dim=1).values
+    kept_scores = torch.gather(scores, 1, kept_idx)
+    kept_valid = torch.isfinite(kept_scores)
+
+    # Cache one output set per active-batch shape.  Active shrink revisits the
+    # same shapes across requests/repeats, so a single mutable slot would force
+    # allocator traffic whenever B changes.
+    fast_outputs = sb_batch.setdefault("fast_fin_outputs", {})
+    shape_key = (B, N)
+    out = fast_outputs.get(shape_key)
+    if out is None:
+        out = {
+            "tokens": torch.empty(B, N, dtype=torch.long, device=device),
+            "parents": torch.empty(B, N, dtype=torch.long, device=device),
+            "topo_parents": torch.empty(B, N, dtype=torch.long, device=device),
+            "lps": torch.empty(B, N, dtype=torch.float32, device=device),
+            "depth": torch.empty(B, N, dtype=torch.long, device=device),
+            "positions": torch.empty(B, N, dtype=torch.long, device=device),
+            "mask": torch.empty(B, N, N, dtype=torch.bool, device=device),
+            "retrieve_index": torch.empty(B, N, dtype=torch.long, device=device),
+            "next_token": torch.empty(B, N, dtype=torch.long, device=device),
+            "next_sibling": torch.empty(B, N, dtype=torch.long, device=device),
+        }
+        fast_outputs[shape_key] = out
+
+    block_n = triton.next_power_of_2(N)
+    _finalize_one_block_fixed_kernel[(B,)](
+        tree_buf_b["tokens"], tree_buf_b["parents"], tree_buf_b["lps"],
+        kept_idx, kept_valid, sample_tokens_b[:, 0], seq_lens_b,
+        out["tokens"], out["parents"], out["topo_parents"],
+        out["lps"], out["depth"], out["positions"], out["mask"],
+        out["retrieve_index"], out["next_token"], out["next_sibling"],
+        tree_buf_b["tokens"].shape[1], budget, N, N * N,
+        N=N, BUDGET=budget, BLOCK_N=block_n, MAX_DEPTH=MAX_TREE_DEPTH,
+    )
+
+    return pack_fixed_tree_outputs(
+        sb_batch=sb_batch,
+        batch_capacity=B,
+        active_bs=active_bs,
+        tree_tokens=N,
+    )
+
+
+def pack_fixed_tree_outputs(
+    sb_batch: dict,
+    batch_capacity: int,
+    active_bs: int,
+    tree_tokens: int,
+) -> list:
+    """Package captured fixed-width output buffers without launching kernels."""
+    if not 0 < active_bs <= batch_capacity:
+        raise RuntimeError(
+            f"Invalid active batch {active_bs} for tree capacity {batch_capacity}."
+        )
+    out = sb_batch["fast_fin_outputs"][(batch_capacity, tree_tokens)]
+    active_out = {name: tensor[:active_bs] for name, tensor in out.items()}
+    empty_ri = sb_batch.get("empty_retrieve_index")
+    if empty_ri is None:
+        empty_ri = torch.empty(
+            0,
+            MAX_TREE_DEPTH + 1,
+            dtype=torch.long,
+            device=out["tokens"].device,
+        )
+        sb_batch["empty_retrieve_index"] = empty_ri
+
+    trees = []
+    for b in range(active_bs):
+        depth = active_out["depth"][b]
+        trees.append({
+            "draft_token": active_out["tokens"][b],
+            "parents": active_out["parents"][b],
+            "depth": depth,
+            "cum_log_prob": active_out["lps"][b],
+            "retrieve_index": empty_ri,
+            "tree_mask": active_out["mask"][b],
+            "position_ids": depth,
+            "retrive_next_token": active_out["next_token"][b],
+            "retrive_next_sibling": active_out["next_sibling"][b],
+            # Worker consumes active request-major zero-copy views.
+            "_batched_fixed_outputs": active_out,
+        })
+    return trees
+
+
+def finalize_tree_fixed_batched(
+    tree_buf_b: dict,
+    raw_sizes_b: torch.Tensor,
+    sample_tokens_b: torch.Tensor,
+    budget: int,
+    raw_capacity: int,
+    scratch: dict,
+    active_bs: int,
+    dedup_depth: int = 4,
+    seq_lens_b: Optional[torch.Tensor] = None,
+) -> list:
+    """Finalize one- or multi-block capacity rows at a fixed verify width."""
+    return finalize_one_block_fixed_batched(
+        tree_buf_b=tree_buf_b,
+        raw_sizes_b=raw_sizes_b,
+        sample_tokens_b=sample_tokens_b,
+        budget=budget,
+        raw_capacity=raw_capacity,
+        sb_batch=scratch,
+        active_bs=active_bs,
+        dedup_depth=dedup_depth,
+        seq_lens_b=seq_lens_b,
+    )
+
 
 def gpu_prune_tree(tn_tokens, tn_parents, tn_lps, tn_ranks, tn_blocks, tn_slots,
                    n_nodes, budget, max_tree_depth=MAX_TREE_DEPTH):
@@ -1377,6 +2229,270 @@ def finalize_tree_gpu(
         "tree_mask": tree_mask,
         "position_ids": tree_position_ids,
     }
+
+
+# =============================================================================
+#   Batched finalize (S3c)
+# =============================================================================
+
+def _alloc_finalize_scratch(
+    sb_batch: dict, B: int, max_Np1: int, max_tree_depth: int, device: torch.device,
+):
+    """Lazy-init [B, max_Np1] etc. batched finalize buffers in sb_batch."""
+    cur_B = sb_batch.get('fin_B', 0)
+    cur_NP1 = sb_batch.get('fin_max_Np1', 0)
+    cur_D = sb_batch.get('fin_max_depth', 0)
+    need = cur_B < B or cur_NP1 < max_Np1 or cur_D < max_tree_depth
+
+    if need or 'fin_parent' not in sb_batch:
+        sb_batch['fin_parent'] = torch.zeros(B, max_Np1, dtype=torch.int32, device=device)
+        sb_batch['fin_depth'] = torch.zeros(B, max_Np1, dtype=torch.int32, device=device)
+        sb_batch['fin_mask'] = torch.zeros(B, max_Np1, max_Np1, dtype=torch.float32, device=device)
+        sb_batch['fin_is_parent'] = torch.zeros(B, max_Np1, dtype=torch.bool, device=device)
+        sb_batch['fin_leaves'] = torch.zeros(B, max_Np1, dtype=torch.int32, device=device)
+        sb_batch['fin_num_leaves'] = torch.zeros(B, dtype=torch.int32, device=device)
+        sb_batch['fin_ri'] = torch.full(
+            (B, max_Np1, max_tree_depth + 1), -1, dtype=torch.int32, device=device,
+        )
+        sb_batch['fin_B'] = B
+        sb_batch['fin_max_Np1'] = max_Np1
+        sb_batch['fin_max_depth'] = max_tree_depth
+
+
+def _sort_retrieve_indices_gpu_batched(
+    ri_b: torch.Tensor, num_leaves_b: torch.Tensor, maxitem: int,
+) -> torch.Tensor:
+    """Batched lex-sort of retrieve_indices rows.
+
+    ri_b: [B, max_Np1, D] int32.  num_leaves_b: [B] int32 — only first
+    num_leaves[b] rows are real; pad rows have all -1 from caller init.
+    Returns [B, max_Np1, D] long with each [b, :num_leaves[b]] sorted by
+    lex key (treating -1 as +inf).
+    """
+    B, max_NL, D = ri_b.shape
+    if B == 0 or max_NL == 0:
+        return ri_b.to(torch.long)
+    device = ri_b.device
+    ri_l = ri_b.to(torch.long)
+    masked = torch.where(ri_l >= 0, ri_l, torch.full_like(ri_l, maxitem))
+    weights = torch.tensor(
+        [(maxitem + 1) ** (D - 1 - d) for d in range(D)],
+        dtype=torch.float64, device=device,
+    )                                                                    # [D]
+    keys = (masked.to(torch.float64) * weights.view(1, 1, D)).sum(dim=2)  # [B, max_NL]
+    # Pad rows (lid >= num_leaves) are full of -1 → key = D * maxitem (huge);
+    # they sort last naturally.  Plus we override to ensure they're stable.
+    arange_nl = torch.arange(max_NL, device=device).unsqueeze(0).expand(B, -1)
+    pad_mask = arange_nl >= num_leaves_b.unsqueeze(1).long()
+    keys = torch.where(pad_mask, torch.full_like(keys, float('inf')), keys)
+    order = torch.argsort(keys, dim=1, stable=True)                      # [B, max_NL]
+    sorted_ri = torch.gather(
+        ri_l, dim=1, index=order.unsqueeze(-1).expand(-1, -1, D),
+    )
+    return sorted_ri
+
+
+def finalize_tree_gpu_batched(
+    tree_buf_b: dict,                       # batched [B, MAX_NODES] views
+    n_nodes_per_req_cpu: list,              # length B; post-prune sizes (already on host)
+    pruned_tensors_per_req: list,           # length B; dict of new tensors if prune ran, else None
+    batched_pruned: Optional[dict],          # [B, budget] tensors when every row pruned
+    sample_tokens_b: torch.Tensor,          # [B, 1] long
+    budget: int,
+    K: int,
+    max_blocks: int,
+    sb_batch: dict,
+    device: torch.device,
+    max_tree_depth: int = MAX_TREE_DEPTH,
+    need_retrieve_index: bool = True,
+) -> list:
+    """Batched end-to-end finalize across B reqs.
+
+    Replaces B per-req ``finalize_tree_gpu`` calls (~5 kernel launches each
+    + many tensor allocs) with a single batched depth_mask + retrieve +
+    sort + per-req output dict construction.  Prune is still run per-req
+    upstream when needed (its work depends on per-req N and is rare-path
+    for non-saturated trees).
+
+    Returns a list of B tree dicts with the same schema as
+    :func:`finalize_tree_gpu`.
+    """
+    B = len(n_nodes_per_req_cpu)
+    max_Np1 = budget + 1
+
+    _alloc_finalize_scratch(sb_batch, B, max_Np1, max_tree_depth, device)
+    parent_t_b = sb_batch['fin_parent']        # [B, max_Np1] i32
+    depth_t_b = sb_batch['fin_depth']          # [B, max_Np1] i32
+    mask_b = sb_batch['fin_mask']              # [B, max_Np1, max_Np1] f32
+    is_parent_b = sb_batch['fin_is_parent']    # [B, max_Np1] bool
+    leaves_b = sb_batch['fin_leaves']          # [B, max_Np1] i32
+    num_leaves_b = sb_batch['fin_num_leaves']  # [B] i32
+    ri_b = sb_batch['fin_ri']                  # [B, max_Np1, max_depth+1] i32
+
+    # Zero relevant slices [:B] only (buffers may be over-allocated for B_max).
+    parent_t_b[:B].zero_()
+    depth_t_b[:B].zero_()
+    mask_b[:B].zero_()
+    if need_retrieve_index:
+        is_parent_b[:B].zero_()
+        ri_b[:B].fill_(-1)
+
+    # Fill parent_t_b from post-prune parents.  The common saturated path
+    # prunes every row to the same budget, so transform the whole batch in one
+    # operation instead of launching B independent torch.where kernels.
+    if batched_pruned is not None:
+        tn_p_b = batched_pruned['parents'][:B, :budget]
+        parent_t_b[:B, 1:budget + 1] = torch.where(
+            tn_p_b >= 0,
+            (tn_p_b + 1).to(torch.int32),
+            torch.zeros_like(tn_p_b, dtype=torch.int32),
+        )
+    else:
+        for b in range(B):
+            N_b = n_nodes_per_req_cpu[b]
+            if N_b == 0:
+                continue
+            pruned = pruned_tensors_per_req[b]
+            if pruned is not None:
+                tn_p = pruned['parents'][:N_b]
+            else:
+                tn_p = tree_buf_b['parents'][b, :N_b]
+            parent_t_b[b, 1:N_b + 1] = torch.where(
+                tn_p >= 0,
+                (tn_p + 1).to(torch.int32),
+                torch.zeros(N_b, dtype=torch.int32, device=device),
+            )
+            # pad positions [N_b+1, max_Np1) already 0 from zero_() — the
+            # kernel walks parent=0 (self-root) for these, finishes fast,
+            # and writes are discarded when caller slices [:Np1_b].
+
+    # Launch batched depth_mask kernel.
+    # sb_batch buffers are over-allocated to B_max-ever-seen; slice to current B
+    # before reshape so view() succeeds and bidx range matches.
+    parent_t_view = parent_t_b[:B]
+    depth_t_view = depth_t_b[:B]
+    mask_view = mask_b[:B].reshape(B, -1)
+    is_parent_view = is_parent_b[:B]
+    leaves_view = leaves_b[:B]
+    num_leaves_view = num_leaves_b[:B]
+    ri_view_all = ri_b[:B]
+    _tree_depth_mask_kernel_batched[(B, max_Np1)](
+        parent_t_view, depth_t_view, mask_view,
+        max_Np1, max_Np1 * max_Np1,
+        MAX_DEPTH=max_tree_depth,
+    )
+
+    if need_retrieve_index:
+        # Extract leaves per req via vectorized torch ops.  is_parent[b, p] =
+        # True iff some node i in (0, Np1_b) has parent_t[b, i] = p.
+        # Cap mask so pad rows don't pollute is_parent.
+        arange_np1 = torch.arange(max_Np1, device=device).unsqueeze(0).expand(B, -1)
+        np1_per_req_t = torch.tensor(
+            [n_nodes_per_req_cpu[b] + 1 for b in range(B)],
+            device=device, dtype=torch.long,
+        )
+        valid_node_mask = arange_np1 < np1_per_req_t.unsqueeze(1)
+        valid_for_scatter = valid_node_mask.clone()
+        valid_for_scatter[:, 0] = False
+        bidx_grid = torch.arange(B, device=device).unsqueeze(1).expand(-1, max_Np1)
+        parent_idx_2d = parent_t_view.long()
+        sel_b = bidx_grid[valid_for_scatter]
+        sel_p = parent_idx_2d[valid_for_scatter]
+        if sel_b.numel() > 0:
+            is_parent_view[sel_b, sel_p] = True
+
+        is_leaf_b = (~is_parent_view) & valid_node_mask
+        leaf_positions = torch.where(
+            is_leaf_b, arange_np1, torch.full_like(arange_np1, max_Np1),
+        )
+        leaves_sorted, _ = leaf_positions.sort(dim=1)
+        leaves_view.copy_(leaves_sorted.to(torch.int32))
+        num_leaves_view.copy_(is_leaf_b.sum(dim=1).to(torch.int32))
+
+        _tree_retrieve_kernel_batched[(B, max_Np1)](
+            parent_t_view, depth_t_view, leaves_view, num_leaves_view, ri_view_all,
+            max_tree_depth, max_Np1, max_Np1 * (max_tree_depth + 1),
+            MAX_DEPTH=max_tree_depth,
+        )
+        ri_sorted_b = _sort_retrieve_indices_gpu_batched(
+            ri_view_all, num_leaves_view, max_Np1 + 5,
+        )
+        # Only the generic tree API needs leaf counts on the host.  The SGLang
+        # SpecBlock verifier consumes parent links directly and skips this sync.
+        num_leaves_cpu = num_leaves_view.cpu().tolist()
+    else:
+        ri_sorted_b = None
+        num_leaves_cpu = None
+
+    # Materialize fresh batched outputs once.  Returning views keeps the same
+    # per-request API while avoiding B independent allocations/clones for every
+    # field.  These tensors are distinct from reusable sb_batch scratch, so the
+    # next draft iteration cannot overwrite data still consumed by verify.
+    depth_out_b = depth_t_view.long()
+    mask_out_b = mask_b[:B].clone()
+    draft_tokens_b = torch.empty(
+        B, max_Np1, dtype=torch.long, device=device,
+    )
+    parents_full_b = torch.full(
+        (B, max_Np1), -1, dtype=torch.long, device=device,
+    )
+    cum_lp_full_b = torch.zeros(
+        B, max_Np1, dtype=torch.float32, device=device,
+    )
+    draft_tokens_b[:, 0] = sample_tokens_b[:, 0]
+
+    if need_retrieve_index:
+        ri_out_b = ri_sorted_b.clone()
+        empty_ri = None
+    else:
+        ri_out_b = None
+        empty_ri = torch.empty(
+            0, max_tree_depth + 1, dtype=torch.long, device=device,
+        )
+
+    if batched_pruned is not None:
+        draft_tokens_b[:, 1:budget + 1] = batched_pruned['tokens'][:B, :budget]
+        parents_full_b[:, 1:budget + 1] = batched_pruned['parents'][:B, :budget]
+        cum_lp_full_b[:, 1:budget + 1] = batched_pruned['lps'][:B, :budget]
+    else:
+        for b in range(B):
+            N_b = n_nodes_per_req_cpu[b]
+            if N_b == 0:
+                continue
+            pruned = pruned_tensors_per_req[b]
+            if pruned is not None:
+                tn_tokens = pruned['tokens'][:N_b]
+                tn_parents = pruned['parents'][:N_b]
+                tn_lps = pruned['lps'][:N_b]
+            else:
+                tn_tokens = tree_buf_b['tokens'][b, :N_b]
+                tn_parents = tree_buf_b['parents'][b, :N_b]
+                tn_lps = tree_buf_b['lps'][b, :N_b]
+
+            draft_tokens_b[b, 1:N_b + 1] = tn_tokens
+            parents_full_b[b, 1:N_b + 1] = tn_parents.long()
+            cum_lp_full_b[b, 1:N_b + 1] = tn_lps.float()
+
+    trees = []
+    for b in range(B):
+        Np1_b = n_nodes_per_req_cpu[b] + 1
+        depth_per_req = depth_out_b[b, :Np1_b]
+        if need_retrieve_index:
+            nl = num_leaves_cpu[b]
+            ri_per_req = ri_out_b[b, :max(nl, 1), :]
+        else:
+            ri_per_req = empty_ri
+        trees.append({
+            "draft_token": draft_tokens_b[b, :Np1_b],
+            "parents": parents_full_b[b, :Np1_b],
+            "depth": depth_per_req,
+            "cum_log_prob": cum_lp_full_b[b, :Np1_b],
+            "retrieve_index": ri_per_req,
+            "tree_mask": mask_out_b[b, :Np1_b, :Np1_b],
+            "position_ids": depth_per_req,
+        })
+
+    return trees
 
 
 # =============================================================================
@@ -1695,32 +2811,38 @@ def build_tree_gpu(
     is_paged_cross = bool(cross_kv_cache) and _is_paged_cache(cross_kv_cache[0])
 
     if is_paged_cross:
-        cross_count = int(cross_kv_cache[0][2])
+        stored_cross_count = int(cross_kv_cache[0][2])
+        # The final K entries are block-0's current slots.  They are visible
+        # only through the path-specific TTT cache below; exposing them again
+        # as full cross context leaks future/sibling slots and double-counts KV.
+        cross_count = max(stored_cross_count - K, 0)
         # paged 5-tuple: [pool, layer_id, count, cross_loc, new_cross_loc].
-        # cross_loc may be 1D [count] (single-req upstream) — expand to
-        # [N_pend, count] so the paged Triton kernel sees per-row indices.
+        # cross_loc may be 1D [stored_count] (single-req upstream) — retain
+        # only persistent history, then expand for every pending row.
         batch_cross_cache = []
         for layer_cache in cross_kv_cache:
-            pool, layer_id, count, cross_loc, new_cross_loc = layer_cache
+            pool, layer_id, _count, cross_loc, new_cross_loc = layer_cache
+            cross_loc = cross_loc[:cross_count] if cross_loc is not None else None
             if cross_loc is not None and cross_loc.dim() == 1:
                 cross_loc_2d = cross_loc.unsqueeze(0).expand(N_pend, -1).contiguous()
             else:
                 cross_loc_2d = cross_loc
             batch_cross_cache.append(
-                [pool, layer_id, count, cross_loc_2d, new_cross_loc]
+                [pool, layer_id, cross_count, cross_loc_2d, new_cross_loc]
             )
     else:
-        cross_count = cross_kv_cache[0][2] if cross_kv_cache else 0
+        stored_cross_count = int(cross_kv_cache[0][2]) if cross_kv_cache else 0
+        cross_count = max(stored_cross_count - K, 0)
         batch_cross_cache = []
         for layer_cache in cross_kv_cache:
-            k_buf, v_buf, count = layer_cache[0], layer_cache[1], layer_cache[2]
-            if count > 0 and k_buf is not None:
-                k_view = k_buf[:, :, :count, :]
-                v_view = v_buf[:, :, :count, :]
+            k_buf, v_buf = layer_cache[0], layer_cache[1]
+            if cross_count > 0 and k_buf is not None:
+                k_view = k_buf[:, :, :cross_count, :]
+                v_view = v_buf[:, :, :cross_count, :]
                 batch_cross_cache.append([
                     k_view.expand(N_pend, -1, -1, -1),
                     v_view.expand(N_pend, -1, -1, -1),
-                    count,
+                    cross_count,
                 ])
             else:
                 batch_cross_cache.append([None, None, 0])
@@ -2012,6 +3134,8 @@ def build_tree_batched_gpu(
     rank_to_factor: Tuple[int, ...],
     d2t: Optional[torch.Tensor],
     scratch_b: List[dict],
+    need_retrieve_index: bool = True,
+    block1_top_indices_b: Optional[torch.Tensor] = None,
 ) -> List[dict]:
     """End-to-end GPU tree builder for B>1 reqs.
 
@@ -2082,14 +3206,28 @@ def build_tree_batched_gpu(
     # ---- Phase 1 batched setup: do log_softmax / argmax / topk / gather
     # ONCE on [B, K, V] / [B, K, ...] inputs (was B per-req calls with
     # ~8 small kernel launches each = ~32 kernel launches at bs=4). ----
-    all_log_probs_b = F.log_softmax(block1_logits_b.float(), dim=-1)         # [B, K, V]
     all_rank_preds_b = block1_rank_logits_b.argmax(dim=-1)                   # [B, K]
-    all_top_idx_b = torch.topk(block1_logits_b, max_topk, dim=-1).indices    # [B, K, max_topk]
+    cached_topk = (
+        block1_top_indices_b is not None
+        and block1_top_indices_b.shape[-1] >= max_topk
+    )
+    if cached_topk:
+        # The rank head already sorted these exact b0 logits.  Reuse its
+        # candidate indices; retain F.log_softmax so cumulative scores stay
+        # bit-identical to the established tree builder.
+        all_top_idx_b = block1_top_indices_b[..., :max_topk]
+        all_log_probs_b = F.log_softmax(block1_logits_b.float(), dim=-1)
+        all_top_lps_b = all_log_probs_b.gather(2, all_top_idx_b)
+    else:
+        all_log_probs_b = F.log_softmax(block1_logits_b.float(), dim=-1)
+        all_top_idx_b = torch.topk(
+            block1_logits_b, max_topk, dim=-1,
+        ).indices
+        all_top_lps_b = all_log_probs_b.gather(2, all_top_idx_b)
     if d2t is not None:
         all_top_target_b = all_top_idx_b + d2t[all_top_idx_b]
     else:
         all_top_target_b = all_top_idx_b
-    all_top_lps_b = all_log_probs_b.gather(2, all_top_idx_b)                 # [B, K, max_topk]
     all_greedy_tgt_b = all_top_target_b[:, :, 0].contiguous()                # [B, K]
     all_greedy_lps_b = all_top_lps_b[:, :, 0].contiguous().to(torch.float32) # [B, K]
     all_rank_preds_long_b = all_rank_preds_b.to(torch.long)
@@ -2128,6 +3266,41 @@ def build_tree_batched_gpu(
         torch.cuda.synchronize()
         _bt_p1b = _bt_time.perf_counter()
         _bt_t1_loop = _bt_p1b - _bt_p1a
+
+    # The production checkpoint expands one draft block.  At fixed verify
+    # width, finalize directly from GPU sizes: no sizes4 D2H barrier, Python
+    # per-request metadata, generic prune, or separate topology-link pass.
+    if max_blocks <= 1:
+        trees = finalize_one_block_fixed_batched(
+            tree_buf_b=tree_buf_b,
+            raw_sizes_b=sizes4_b,
+            sample_tokens_b=initial_input_id_b,
+            budget=total_tokens,
+            raw_capacity=max_block1_nodes,
+            sb_batch=sb_batch,
+        )
+        if _bt_deep:
+            torch.cuda.synchronize()
+            _bt_fast_end = _bt_time.perf_counter()
+            st = build_tree_batched_gpu.__dict__.setdefault(
+                "_DEEP_FAST_STATE",
+                {"n": 0, "setup": 0.0, "mega": 0.0, "finalize": 0.0},
+            )
+            st["n"] += 1
+            st["setup"] += _bt_t1_setup
+            st["mega"] += _bt_t1_loop
+            st["finalize"] += _bt_fast_end - _bt_p1b
+            if st["n"] % 50 == 0:
+                n = st["n"]
+                import logging as _lg
+                _lg.getLogger(__name__).info(
+                    "[DEEPprof:build_tree_bgpu_fast] n=%d setup=%.2f "
+                    "mega=%.2f finalize=%.2f total=%.2fms",
+                    n, st["setup"] / n * 1000, st["mega"] / n * 1000,
+                    st["finalize"] / n * 1000,
+                    (st["setup"] + st["mega"] + st["finalize"]) / n * 1000,
+                )
+        return trees
 
     # ---- Per-req sb alias from batched buffers (no copy).  Downstream
     # Phase 3+4 still loops per-req using these aliases.  cum_alt_buf
@@ -2295,38 +3468,63 @@ def build_tree_batched_gpu(
     else:
         total_alts_cpu = [0] * B
 
-    # ---- Per-req finalize (S3c will batchify) ----
-    trees: List[dict] = []
+    # ---- S3c: BATCHED finalize across all reqs.
+    # Per-req: compute n_nodes_final + run prune (if N>budget) into a
+    # per-req post-prune scratch dict.  Then call finalize_tree_gpu_batched
+    # which does depth_mask + retrieve + sort + output dict packing in
+    # a single batched pass (was 5 kernel launches × B reqs). ----
+    if _bt_deep:
+        torch.cuda.synchronize()
+        _bt_e = _bt_time.perf_counter()
+
+    raw_n_nodes_per_req: List[int] = []
+    sample_tokens_b = initial_input_id_b[:, -1:]  # [B, 1]
+
     for b in range(B):
         st = per_req[b]
-        sb = st['sb']
-        tree_buf = sb['tree_buf']
         n_nodes_b1 = st['n_nodes_b1']
         N_b_in_concat = cum_off[b + 1] - cum_off[b]
-
         if max_blocks >= 2 and N_b_in_concat > 0:
             n_nodes_final = n_nodes_b1 + N_b_in_concat * K + total_alts_cpu[b]
         else:
             n_nodes_final = n_nodes_b1
+        raw_n_nodes_per_req.append(n_nodes_final)
 
-        if _bt_deep:
-            torch.cuda.synchronize()
-            _bt_e = _bt_time.perf_counter()
+    prune_rows = [
+        b for b, n_nodes in enumerate(raw_n_nodes_per_req)
+        if n_nodes > total_tokens
+    ]
+    batched_pruned = gpu_prune_tree_batched(
+        tree_buf_b, raw_n_nodes_per_req, prune_rows, total_tokens,
+    )
+    pruned_row_to_index = {row: idx for idx, row in enumerate(prune_rows)}
 
-        sample_token = initial_input_id_b[b, -1:]  # [1]
-        tree = finalize_tree_gpu(
-            tree_buf, n_nodes_final, sample_token,
-            total_tokens, K, max_blocks,
-        )
-        trees.append(tree)
+    n_nodes_per_req_cpu: List[int] = []
+    pruned_tensors_per_req: List[Optional[dict]] = []
+    for b, n_nodes_final in enumerate(raw_n_nodes_per_req):
+        prune_idx = pruned_row_to_index.get(b)
+        if prune_idx is None:
+            pruned_tensors_per_req.append(None)
+            n_nodes_per_req_cpu.append(n_nodes_final)
+            continue
+        pruned_tensors_per_req.append({
+            name: tensor[prune_idx]
+            for name, tensor in batched_pruned.items()
+        })
+        n_nodes_per_req_cpu.append(total_tokens)
 
-        if _bt_deep:
-            torch.cuda.synchronize()
-            _bt_f = _bt_time.perf_counter()
-            _bt_t34_finalize += _bt_f - _bt_e
+    all_rows_pruned = len(prune_rows) == B
+    trees = finalize_tree_gpu_batched(
+        tree_buf_b, n_nodes_per_req_cpu, pruned_tensors_per_req,
+        batched_pruned if all_rows_pruned else None,
+        sample_tokens_b, total_tokens, K, max_blocks,
+        sb_batch, device, need_retrieve_index=need_retrieve_index,
+    )
 
     if _bt_deep:
         torch.cuda.synchronize()
+        _bt_f = _bt_time.perf_counter()
+        _bt_t34_finalize += _bt_f - _bt_e
         _bt_t_p34 = _bt_time.perf_counter()
         st = build_tree_batched_gpu.__dict__.setdefault(
             "_DEEP_STATE",
@@ -2388,7 +3586,8 @@ def build_tree_gpu_capturable_region(
     block1_rank_logits: torch.Tensor,                       # [1, K, rank_classes]
     block1_hidden: torch.Tensor,                            # [1, K, H]
     block1_ttt_kv: List[Tuple[torch.Tensor, torch.Tensor]],
-    cross_kv_cache: List[List],                             # paged 5-tuple list, layer-shared cross_loc
+    cross_kv_cache: List[List],                             # paged 5-tuple list, static-width cross_loc
+    cross_valid_count_t: torch.Tensor,                      # [1] int, live persistent cross prefix
     position_id_t: torch.Tensor,                            # [1] long  (replaces int)
     K: int,
     max_blocks: int,
@@ -2500,25 +3699,30 @@ def build_tree_gpu_capturable_region(
     arange_K_t = torch.arange(K, device=device)
     batch_ttt_mask = arange_K_t.unsqueeze(0) < pend_ttt_valid_t.unsqueeze(1)
 
-    # cross_kv_cache passed in is already paged 5-tuple with static cross_loc.
-    # Expand to [N_pend_capture, cross_count] for the paged kernel.
-    cross_count = cross_kv_cache[0][2]
-    if isinstance(cross_count, torch.Tensor):
-        cross_count_int = int(cross_count.item())  # 1 sync; happens once outside graph
-    else:
-        cross_count_int = int(cross_count)
+    # cross_kv_cache carries a static bucket width while cross_valid_count_t
+    # changes on every replay.  The final K live slots were removed by the
+    # graph runner because block-2 sees them through its path-specific TTT
+    # cache.  Keep the static width for graph shape and mask sentinel padding
+    # out of the attention softmax.
+    cross_count_int = int(cross_kv_cache[0][2])
     batch_cross_cache = []
     for layer_cache in cross_kv_cache:
-        pool, layer_id, count, cross_loc, new_cross_loc = layer_cache
+        pool, layer_id, _count, cross_loc, new_cross_loc = layer_cache
         if cross_loc is not None and cross_loc.dim() == 1:
             cross_loc_2d = cross_loc.unsqueeze(0).expand(N_pend_capture, -1).contiguous()
         else:
             cross_loc_2d = cross_loc
-        batch_cross_cache.append([pool, layer_id, count, cross_loc_2d, new_cross_loc])
+        batch_cross_cache.append(
+            [pool, layer_id, cross_count_int, cross_loc_2d, new_cross_loc]
+        )
 
     if cross_count_int > 0:
-        cross_ones = batch_ttt_mask.new_ones(N_pend_capture, cross_count_int)
-        full_kv_mask = torch.cat([cross_ones, batch_ttt_mask], dim=1)
+        cross_offsets = torch.arange(
+            cross_count_int, device=device, dtype=cross_valid_count_t.dtype
+        )
+        cross_mask = cross_offsets.unsqueeze(0) < cross_valid_count_t.reshape(1, 1)
+        cross_mask = cross_mask.expand(N_pend_capture, -1)
+        full_kv_mask = torch.cat([cross_mask, batch_ttt_mask], dim=1)
     else:
         full_kv_mask = batch_ttt_mask
 
@@ -2531,7 +3735,7 @@ def build_tree_gpu_capturable_region(
     # ---- Block-2 forward (graph-safe variant) ----
     # pos_ids must be [N_pend, K] (one position per slot per pend row).
     # Each pend row's slot k is at absolute position ``position_id + 1 + k``.
-    # The non-graph forward_with_cache (specblock_inference.py:127-142)
+    # The non-graph forward_with_cache (specblock_shift_inference.py:127-142)
     # builds the same shape from int position_id; the graph variant takes
     # pos_ids as input so we precompute it here.
     rope_max_position = getattr(
@@ -2599,3 +3803,260 @@ def build_tree_gpu_capturable_region(
     )
     # On exit: tree_buf populated; sizes4 has [n_nodes_b1, ..., N_pend];
     # sizes1[0] has total_alts_2.
+
+
+def max_block1_structural_nodes(
+    K: int,
+    beam_width: int,
+    rank_slot_topk: Tuple[int, ...],
+) -> int:
+    """Return the exact block-1 structural node upper bound.
+
+    Slot 0 uses ``beam_width`` while slots 1..K-1 use the largest
+    rank-conditioned top-k.  The final ``+1`` accounts for the root.
+    """
+    max_rank_topk = max(rank_slot_topk)
+    return (
+        K
+        + max(beam_width - 1, 0)
+        + max(K - 1, 0) * max(max_rank_topk - 1, 0)
+        + 1
+    )
+
+
+def build_tree_gpu_batched_capturable_region(
+    draft_model,
+    block1_logits_b: torch.Tensor,
+    block1_rank_logits_b: torch.Tensor,
+    block1_hidden_b: torch.Tensor,
+    block1_ttt_kv_b: List[Tuple[torch.Tensor, torch.Tensor]],
+    cross_kv_cache_b: List[List],
+    cross_valid_count_b: torch.Tensor,
+    position_id_b: torch.Tensor,
+    active_mask_b: torch.Tensor,
+    pend_bucket: int,
+    expand_bucket: int,
+    K: int,
+    max_blocks: int,
+    beam_width: int,
+    total_tokens: int,
+    rank_classes: int,
+    rank_slot_topk: Tuple[int, ...],
+    rank_to_factor: Tuple[int, ...],
+    d2t: Optional[torch.Tensor],
+    scratch: dict,
+) -> None:
+    """Capture-safe request-level batched SpecBlock tree construction."""
+    from sglang.srt.speculative.specblock_tree_builder import (
+        compute_slot_topks_bfs_gpu,
+        compute_slot_topks_block1_gpu_batched,
+    )
+
+    B = int(block1_logits_b.shape[0])
+    device = block1_logits_b.device
+    give_up_class = rank_classes - 1
+    max_topk = max(beam_width, max(rank_slot_topk))
+    max_block1_nodes = max_block1_structural_nodes(
+        K, beam_width, rank_slot_topk,
+    )
+    if pend_bucket < max_block1_nodes:
+        raise RuntimeError(
+            "SpecBlock pending graph bucket is smaller than the structural "
+            f"maximum: bucket={pend_bucket}, required={max_block1_nodes}."
+        )
+    if not 0 < expand_bucket <= pend_bucket:
+        raise RuntimeError(
+            "SpecBlock expansion bucket must fit the pending storage bucket: "
+            f"expand={expand_bucket}, pending={pend_bucket}."
+        )
+    max_nodes = max(
+        total_tokens + 200,
+        max_block1_nodes + expand_bucket * K * max_topk + 100,
+    )
+
+    _alloc_batch_scratch(
+        scratch,
+        B=B,
+        max_nodes=max_nodes,
+        pend_max=pend_bucket,
+        bfs_block_n_default=64,
+        rank_slot_topk=rank_slot_topk,
+        rank_to_factor=rank_to_factor,
+        device=device,
+    )
+    tree_buf = scratch["tree_buf"]
+    pend_buf = scratch["pend_buf"]
+    sizes4 = scratch["sizes4"][:B]
+    sizes1 = scratch["sizes1"][:B]
+    rank_slot_topk_t = scratch["rank_slot_topk_t"]
+    rank_to_factor_t = scratch["rank_to_factor_t"]
+
+    for tensor in pend_buf.values():
+        tensor.zero_()
+    pend_buf["cum_lps"].fill_(float("-inf"))
+    sizes1.zero_()
+
+    rank_preds = block1_rank_logits_b.argmax(dim=-1)
+    log_probs = F.log_softmax(block1_logits_b.float(), dim=-1)
+    top_idx = torch.topk(block1_logits_b, max_topk, dim=-1).indices
+    all_top_target = top_idx + d2t[top_idx] if d2t is not None else top_idx
+    all_top_lps = log_probs.gather(2, top_idx)
+    greedy_target = all_top_target[:, :, 0].contiguous()
+    greedy_lps = all_top_lps[:, :, 0].contiguous().to(torch.float32)
+    slot_topks = compute_slot_topks_block1_gpu_batched(
+        greedy_lps,
+        rank_preds.to(torch.long),
+        rank_slot_topk_t,
+        beam_width,
+        rank_classes,
+    )
+
+    _block1_mega_kernel_batched[(B,)](
+        rank_preds.to(torch.int64).contiguous(),
+        greedy_target.to(torch.int64).contiguous(),
+        greedy_lps.contiguous(),
+        all_top_target.to(torch.int64).contiguous(),
+        all_top_lps.to(torch.float32).contiguous(),
+        slot_topks.contiguous(),
+        tree_buf["tokens"], tree_buf["parents"], tree_buf["lps"],
+        tree_buf["ranks"], tree_buf["blocks"], tree_buf["slots"],
+        pend_buf["hidden_slots"], pend_buf["input_ids"],
+        pend_buf["ttt_valid"], pend_buf["node_indices"],
+        pend_buf["cum_lps"], sizes4,
+        max_nodes, pend_bucket,
+        K=K, MAX_TOPK=max_topk, RANK_CLASSES=rank_classes,
+        GIVE_UP_CLASS=give_up_class,
+    )
+    sizes4.mul_(active_mask_b.to(sizes4.dtype).unsqueeze(1))
+
+    if max_blocks <= 1:
+        return
+
+    # Expand only the highest-probability pending roots.  Descendant log
+    # probability can never exceed its pending root, so this preserves the
+    # verifier budget for the most valuable subtrees while halving the fixed
+    # block-2 model batch from 32 to 16 leaves in the production geometry.
+    selected_idx = torch.topk(
+        pend_buf["cum_lps"][:B, :pend_bucket],
+        k=expand_bucket,
+        dim=1,
+    ).indices
+    selected_pend = {
+        name: torch.gather(value[:B, :pend_bucket], 1, selected_idx)
+        for name, value in pend_buf.items()
+    }
+    selected_count = sizes4[:, 3].clamp(max=expand_bucket)
+    sizes4[:, 3].copy_(selected_count)
+
+    pend_slots = selected_pend["hidden_slots"]
+    hidden_index = pend_slots.unsqueeze(2).expand(
+        B, expand_bucket, block1_hidden_b.shape[2]
+    )
+    pend_hidden = block1_hidden_b.gather(1, hidden_index).reshape(
+        B * expand_bucket, 1, block1_hidden_b.shape[2]
+    )
+    pend_input_ids = selected_pend["input_ids"].reshape(
+        B * expand_bucket, 1
+    )
+    ttt_valid = selected_pend["ttt_valid"]
+    slot_offsets = torch.arange(K, device=device, dtype=torch.long)
+    # Keep pending leaves grouped by request.  The grouped paged-attention
+    # kernel shares persistent prefix K/V loads across leaves while preserving
+    # a distinct TTT-valid mask for every leaf.
+    ttt_mask = slot_offsets.reshape(1, 1, K) < ttt_valid.unsqueeze(2)
+
+    cross_width = int(cross_kv_cache_b[0][2])
+    batch_cross_cache = []
+    for layer_cache in cross_kv_cache_b:
+        pool, layer_id, _count, cross_loc, new_cross_loc = layer_cache
+        batch_cross_cache.append(
+            [pool, layer_id, cross_width, cross_loc, new_cross_loc]
+        )
+
+    if cross_width > 0:
+        cross_offsets = torch.arange(
+            cross_width, device=device, dtype=cross_valid_count_b.dtype
+        )
+        full_kv_mask = (
+            cross_offsets.reshape(1, cross_width)
+            < cross_valid_count_b.reshape(B, 1)
+        )
+    else:
+        full_kv_mask = torch.empty(
+            (B, 0), dtype=torch.bool, device=device,
+        )
+
+    batch_ttt_kv = block1_ttt_kv_b
+    pos_ids = (
+        position_id_b.to(torch.long).reshape(B, 1, 1)
+        + 1
+        + slot_offsets.reshape(1, 1, K)
+    ).expand(B, expand_bucket, K).reshape(B * expand_bucket, K)
+    rope_max_position = getattr(
+        draft_model.config, "max_position_embeddings", 131072
+    )
+    block_logits, block_rank_logits, _hidden, _ttt = (
+        draft_model.forward_with_cache_graph(
+            hidden=pend_hidden,
+            input_ids=pend_input_ids,
+            pos_ids=pos_ids,
+            cache=batch_cross_cache,
+            rope_max_position=rope_max_position,
+            ttt_cache=batch_ttt_kv,
+            ttt_mask=ttt_mask,
+            full_kv_mask=full_kv_mask,
+        )
+    )
+
+    (
+        all_rank_preds_2,
+        _all_greedy_tokens_2,
+        all_greedy_target_2,
+        all_greedy_lps_2,
+        _M2,
+        _bf2,
+        _gu2,
+        top_target_all_2,
+        top_lps_all_2,
+    ) = _bfs_gpu_ops_fused(
+        block_logits,
+        block_rank_logits,
+        d2t,
+        max_topk,
+        rank_classes,
+        rank_to_factor_t,
+    )
+    slot_topks_2 = compute_slot_topks_bfs_gpu(
+        all_greedy_lps_2.to(torch.float32),
+        all_rank_preds_2.to(torch.long),
+        rank_slot_topk_t,
+        rank_classes,
+    )
+    valid_leaf_b = (
+        torch.arange(expand_bucket, device=device, dtype=sizes4.dtype)
+        .unsqueeze(0)
+        < sizes4[:, 3:4]
+    ) & active_mask_b.unsqueeze(1)
+    slot_topks_2 = slot_topks_2 * valid_leaf_b.reshape(-1, 1).to(
+        slot_topks_2.dtype
+    )
+    total_alts = triton_build_bfs_fixed_batched(
+        all_rank_preds_2,
+        all_greedy_target_2,
+        all_greedy_lps_2,
+        top_target_all_2,
+        top_lps_all_2,
+        slot_topks_2,
+        valid_leaf_b,
+        selected_pend,
+        tree_buf,
+        sizes4,
+        B=B,
+        pend_bucket=expand_bucket,
+        K=K,
+        max_topk=max_topk,
+        rank_classes=rank_classes,
+        give_up_class=give_up_class,
+        max_nodes=max_nodes,
+    )
+    sizes1[:, 0].copy_(total_alts)

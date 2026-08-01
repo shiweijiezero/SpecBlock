@@ -46,8 +46,8 @@ logs/
 tmp/
 
 # Model weights (large, downloaded separately)
-model/
-models/
+/model/
+/models/
 *.bin
 *.safetensors
 *.pt

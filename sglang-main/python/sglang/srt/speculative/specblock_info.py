@@ -16,7 +16,7 @@ Lifecycle::
     iter >=2 decode:
         draft -- per-req specblock_tree_builder.build_tree(...) then
                  concat -> SpecBlockVerifyInput
-        target_verify -- runs target with custom_mask
+        target_verify -- runs native indexed root-to-node target attention
         verify -- greedy / sampling tree accept (re-uses EAGLE kernels
                   verify_tree_greedy and tree_speculative_sampling_target_only)
         prepare_extend_after_decode -- batch shape rebuild for next iter
@@ -45,7 +45,6 @@ import torch
 import torch.nn.functional as F
 import triton
 
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -83,6 +82,20 @@ if is_cuda():
 # ============================================================
 #  Topology helpers (parents -> EAGLE-format BFS pointers)
 # ============================================================
+
+def specblock_tree_max_depth(K: int, max_blocks: int) -> int:
+    """Return the tree builder's root-inclusive parent-walk depth bound."""
+    K = int(K)
+    max_blocks = int(max_blocks)
+    if K < 1:
+        raise ValueError(f"SpecBlock tree K must be positive, got {K}.")
+    if max_blocks < 1:
+        raise ValueError(
+            f"SpecBlock tree max_blocks must be positive, got {max_blocks}."
+        )
+    # Each block may append a K-token parent chain to an existing path.
+    return K * max_blocks
+
 
 def parents_to_next_token_and_sibling(
     parents: torch.Tensor,
@@ -198,9 +211,10 @@ class SpecBlockDraftInput(SpecInput):
     # Equal to len(cross_loc[i]); kept as an int for fast access in tree
     # builder pad/gather hot paths (avoids `.numel()` per iter).
     cross_count: List[int] = field(default_factory=list)
-    # cross_position[i] is the *position id* used when calling
-    # draft_model.forward_with_cache(position_id=...) for req i.
-    # Returned alongside cache by prefill_and_draft / update_cache_and_draft.
+    # cross_position[i] is the persistent HF-style draft_position returned
+    # by prefill_and_draft / update_cache_and_draft.  The precomputed block-0
+    # tree expands at cross_position[i] - 1; zero-accept rebuilds keep this
+    # persistent value unchanged.
     cross_position: List[int] = field(default_factory=list)
     ttt_k: List[List[torch.Tensor]] = field(default_factory=list)
     ttt_v: List[List[torch.Tensor]] = field(default_factory=list)
@@ -208,6 +222,9 @@ class SpecBlockDraftInput(SpecInput):
     b0_hidden: torch.Tensor = None
     b0_input_id: torch.Tensor = None
     b0_rank_logits: torch.Tensor = None
+    # Sorted candidates already computed by the rank head for these logits.
+    # Reused by one-block tree expansion to avoid duplicate vocab top-k.
+    b0_top_indices: Optional[torch.Tensor] = None
 
     # ---- Worker-injected references (NOT serialized / deepcopied) ----
     # The worker injects its :class:`SpecBlockKVPool` here so that
@@ -258,6 +275,18 @@ class SpecBlockDraftInput(SpecInput):
         """Draft input does not consume tokens itself."""
         return 0, 0
 
+    def release_resources(self) -> None:
+        """Return every live cross-attention slot to the worker pool."""
+        if self.kv_pool is not None:
+            for loc in self.cross_loc:
+                if loc is not None and torch.is_tensor(loc) and loc.numel() > 0:
+                    self.kv_pool.free(loc)
+        self.cross_loc = []
+        self.cross_count = []
+        self.cross_position = []
+        self.ttt_k = []
+        self.ttt_v = []
+
     @classmethod
     def create_idle_input(
         cls,
@@ -285,6 +314,7 @@ class SpecBlockDraftInput(SpecInput):
             b0_hidden=torch.empty((0, K, hidden_size), device=device, dtype=dtype),
             b0_input_id=torch.empty((0, K), device=device, dtype=torch.int64),
             b0_rank_logits=torch.empty((0, K, 1), device=device, dtype=dtype),
+            b0_top_indices=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
@@ -378,6 +408,8 @@ class SpecBlockDraftInput(SpecInput):
                 self.b0_input_id = self.b0_input_id[keep_tensor]
             if self.b0_rank_logits is not None:
                 self.b0_rank_logits = self.b0_rank_logits[keep_tensor]
+            if self.b0_top_indices is not None:
+                self.b0_top_indices = self.b0_top_indices[keep_tensor]
 
         # List fields gathered by Python slicing in lockstep with batch.reqs.
         # cross_loc holds GPU pool indices -- release the indices for
@@ -464,6 +496,7 @@ class SpecBlockDraftInput(SpecInput):
             "b0_hidden",
             "b0_input_id",
             "b0_rank_logits",
+            "b0_top_indices",
         ):
             mine = getattr(self, attr)
             theirs = getattr(other, attr)
@@ -689,7 +722,8 @@ class SpecBlockVerifyInput(SpecInput):
     Tree-flat 1D fields (sum_i N_i, where N_i is each req's tree size):
         draft_token         int64, the candidate token IDs per node.
         positions           int64, BFS position-id per node.
-        custom_mask         bool, packed [sum_i (P_i + N_i) * N_i] mask.
+        custom_mask         bool [sum_i N_i * N_i], request-packed tree-only
+                            ancestor masks; prefix visibility is implicit.
 
     Per-batch 2D BFS pointer fields (B, N_max):
         retrive_index       int64, global flat offset of each tree node.
@@ -698,7 +732,11 @@ class SpecBlockVerifyInput(SpecInput):
         Padding rows beyond N_i are filled with -1.
 
     SpecBlock-specific:
+        tree_parents        int64 [B, N_max], BFS parent per node.
         tree_depth          int64 [sum_i N_i], depth per node in its tree.
+        tree_max_depth      configured maximum token-parent depth emitted by
+                            the tree builder; target native decode uses it as
+                            a fail-stop Triton parent-walk bound.
         tree_lps            float32 [sum_i N_i], path log-prob (for
                             beam-search-style sorting if needed).
 
@@ -728,7 +766,9 @@ class SpecBlockVerifyInput(SpecInput):
     num_tokens_per_batch: int = 0     # fwd_batch_info.py:984
 
     # ---- SpecBlock-specific tree metadata ----
+    tree_parents: torch.Tensor = None
     tree_depth: torch.Tensor = None
+    tree_max_depth: int = 0
     tree_lps: torch.Tensor = None
     tree_sizes_cpu: Optional[List[int]] = None  # per-req actual N_i
 
@@ -811,6 +851,18 @@ class SpecBlockVerifyInput(SpecInput):
         """Verify forward emits draft_token_num tokens per req."""
         return self.draft_token_num, self.draft_token_num
 
+    def release_resources(self) -> None:
+        """Return every carried cross-attention slot to the worker pool."""
+        if self.kv_pool is not None:
+            for loc in self.cross_loc:
+                if loc is not None and torch.is_tensor(loc) and loc.numel() > 0:
+                    self.kv_pool.free(loc)
+        self.cross_loc = []
+        self.cross_count = []
+        self.cross_position = []
+        self.ttt_k = []
+        self.ttt_v = []
+
     @classmethod
     def create_idle_input(
         cls, draft_token_num: int, device: str = "cuda"
@@ -831,6 +883,9 @@ class SpecBlockVerifyInput(SpecInput):
             ),
             draft_token_num=draft_token_num,
             num_tokens_per_batch=draft_token_num,
+            tree_parents=torch.empty(
+                (0, draft_token_num), dtype=torch.int64, device=device
+            ),
             tree_depth=torch.empty((0,), dtype=torch.int64, device=device),
             tree_lps=torch.empty((0,), dtype=torch.float32, device=device),
             tree_sizes_cpu=[],
@@ -892,7 +947,12 @@ class SpecBlockVerifyInput(SpecInput):
             B = len(keep_idx)
         del has_been_filtered  # always gather
 
-        for attr in ("retrive_index", "retrive_next_token", "retrive_next_sibling"):
+        for attr in (
+            "retrive_index",
+            "retrive_next_token",
+            "retrive_next_sibling",
+            "tree_parents",
+        ):
             t = getattr(self, attr)
             if t is not None and t.shape[0] >= B:
                 setattr(self, attr, t[keep_tensor])
@@ -1025,42 +1085,10 @@ class SpecBlockVerifyInput(SpecInput):
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
     ):
-        """Build the attention backend arguments for verify forward.
-
-        Layout: every req contributes draft_token_num query tokens and
-        ``paged_kernel_lens[i] + draft_token_num`` KV tokens. The
-        custom_mask we built at draft() time encodes the tree's parent
-        chain and is passed verbatim to the attention backend.
-        """
-        device = req_pool_indices.device
-        bs = len(req_pool_indices)
-
-        qo_indptr = torch.arange(
-            0,
-            (1 + bs) * self.draft_token_num,
-            step=self.draft_token_num,
-            dtype=torch.int32,
-            device=device,
+        raise RuntimeError(
+            "SpecBlock Shift target verification requires native indexed tree "
+            "attention; legacy packed-mask prefill arguments are unsupported."
         )
-
-        cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
-        cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
-
-        total_kv_len = int(cum_kv_seq_len[-1].item())
-        kv_indices = torch.empty(total_kv_len, dtype=torch.int32, device=device)
-
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
-        )
-
-        return kv_indices, cum_kv_seq_len, qo_indptr, self.custom_mask
 
     # ------------------------------------------------------------
     #  Verify (greedy + sampling)
@@ -1096,8 +1124,14 @@ class SpecBlockVerifyInput(SpecInput):
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
 
         # Bonus: reserve one extra accept slot for the bonus token.
+        accept_capacity = int(self.tree_max_depth) + 1
+        if accept_capacity > self.draft_token_num:
+            raise RuntimeError(
+                "SpecBlock accept path capacity exceeds the verification tree: "
+                f"capacity={accept_capacity}, tree_width={self.draft_token_num}."
+            )
         self.accept_index = torch.full(
-            (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
+            (bs, accept_capacity), -1, dtype=torch.int32, device=self.device
         )
         self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
 
@@ -1107,6 +1141,8 @@ class SpecBlockVerifyInput(SpecInput):
             bs=bs, draft_token_num=self.draft_token_num,
             candidates=candidates,
             target_predict=target_predict,
+            root_candidates=candidates[:, 0],
+            root_target_predict=target_predict[:, 0],
             retrive_index=self.retrive_index,
             retrive_next_token=self.retrive_next_token,
             retrive_next_sibling=self.retrive_next_sibling,
@@ -1129,6 +1165,7 @@ class SpecBlockVerifyInput(SpecInput):
         self._trace(
             "verify_out",
             accept_index=self.accept_index,
+            accept_index_head=self.accept_index[:, :4],
             accept_length=self.accept_length,
             predict=self.predict,
         )
@@ -1155,8 +1192,14 @@ class SpecBlockVerifyInput(SpecInput):
         # See _greedy_verify above for why zero-init.
         self.predict = torch.empty(predict_shape, dtype=torch.int32, device=self.device)
 
+        accept_capacity = int(self.tree_max_depth) + 1
+        if accept_capacity > self.draft_token_num:
+            raise RuntimeError(
+                "SpecBlock accept path capacity exceeds the verification tree: "
+                f"capacity={accept_capacity}, tree_width={self.draft_token_num}."
+            )
         self.accept_index = torch.full(
-            (bs, self.draft_token_num), -1, dtype=torch.int32, device=self.device
+            (bs, accept_capacity), -1, dtype=torch.int32, device=self.device
         )
         self.accept_length = torch.empty((bs,), dtype=torch.int32, device=self.device)
 
@@ -1166,11 +1209,14 @@ class SpecBlockVerifyInput(SpecInput):
         target_probs = F.softmax(
             logits_output.next_token_logits / expanded_temperature, dim=-1
         )
-        target_probs = top_k_renorm_prob(
-            target_probs,
-            torch.repeat_interleave(sampling_info.top_ks, self.draft_token_num, dim=0),
-        )
-        if not torch.all(sampling_info.top_ps == 1.0):
+        if sampling_info.need_top_k_sampling:
+            target_probs = top_k_renorm_prob(
+                target_probs,
+                torch.repeat_interleave(
+                    sampling_info.top_ks, self.draft_token_num, dim=0
+                ),
+            )
+        if sampling_info.need_top_p_sampling:
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(
@@ -1208,49 +1254,99 @@ class SpecBlockVerifyInput(SpecInput):
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         skip_finalize: bool = False,
-    ):
-        """Append accepted tokens to req.output_ids; flatten accept_index.
+    ) -> Optional[torch.Tensor]:
+        """Append accepted tokens and compact the verified tree path.
 
-        ``skip_finalize`` (V2 path): skip Python-side req.output_ids /
-        req.check_finished() / req.spec_verify_ct updates.  V2 scheduler
-        does these in process_batch_result_decode (it expects req.finished()
-        to NOT be set during forward, so it can run release_kv_cache).
-        Still computes accept_index slicing + verified_id which downstream
-        needs.
+        V1 needs the accepted IDs on the host to run per-token stop and grammar
+        handling. Copy only the compact accepted paths, rather than copying the
+        full tree-shaped ``accept_index`` and ``predict`` tensors. The returned
+        CPU tensor contains bonus-inclusive path lengths and is also reused by
+        ``verify`` for cache accounting, avoiding a second length D2H copy.
+
+        ``skip_finalize`` (V2 path) leaves Python-side request finalization to
+        the scheduler. It intentionally performs no D2H transfer.
         """
-        has_finished = False
+        # Keep the 2-D form until V1 stop handling has decided whether an
+        # accepted path needs truncation. These indices also preserve the
+        # non-contiguous tree path selected by target acceptance.
+        compact_accept_index = self.accept_index[self.accept_index != -1]
+        compact_verified_id = self.predict[compact_accept_index]
+        accept_lens_cpu = None
 
         if not skip_finalize:
-            accept_index_cpu = self.accept_index.tolist()
-            predict_cpu = self.predict.tolist()
+            # accept_length excludes the bonus token; every accepted path has
+            # exactly one bonus token. These are the only V1 D2H payloads.
+            accept_lens_cpu = (self.accept_length + 1).to(
+                "cpu", non_blocking=True
+            )
+            compact_verified_id_cpu = compact_verified_id.to(
+                "cpu", non_blocking=True
+            )
+            path_lens = accept_lens_cpu.tolist()
+            verified_ids = compact_verified_id_cpu.tolist()
 
-            for i, (req, accept_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
-                for j, idx in enumerate(accept_row):
-                    if idx == -1:
-                        break
-                    token_id = predict_cpu[idx]
+            has_finished = False
+            final_path_lens = []
+            offset = 0
+            for req, path_len in zip(batch.reqs, path_lens):
+                # Count emitted tokens independently of req.output_ids, whose
+                # prefix belongs to previous decode iterations.
+                accepted_this_req = 0
+                for token_id in verified_ids[offset : offset + path_len]:
+                    accepted_this_req += 1
                     req.output_ids.append(token_id)
                     req.check_finished()
                     if req.finished():
                         has_finished = True
-                        self.accept_index[i, j + 1:] = -1
                         break
-                    else:
-                        if req.grammar is not None:
-                            req.grammar.accept_token(token_id)
+                    if req.grammar is not None:
+                        req.grammar.accept_token(token_id)
+
                 req.spec_verify_ct += 1
-                req.spec_accepted_tokens += (
-                    sum(1 for idx in accept_row if idx != -1) - 1
-                )
+                # Preserve V1 accounting: this records target-tree acceptance
+                # before request-local stopping truncates the committed path.
+                req.spec_accepted_tokens += path_len - 1
+                final_path_lens.append(accepted_this_req)
+                offset += path_len
 
             if has_finished:
-                self.accept_length = (self.accept_index != -1).sum(dim=1) - 1
+                # Rebuild the bonus-inclusive accepted length vector from the
+                # CPU decisions, then truncate the GPU paths in one vectorized
+                # operation. This keeps KV freeing, hidden/logit compaction,
+                # and scheduler lengths aligned with early stop/EOS handling.
+                final_path_lens_cpu = torch.tensor(
+                    final_path_lens, dtype=self.accept_length.dtype
+                )
+                final_path_lens_gpu = final_path_lens_cpu.to(
+                    self.device, non_blocking=True
+                )
+                positions = torch.arange(
+                    self.accept_index.shape[1], device=self.device
+                )
+                self.accept_index.masked_fill_(
+                    positions.unsqueeze(0) >= final_path_lens_gpu.unsqueeze(1),
+                    -1,
+                )
+                self.accept_length = final_path_lens_gpu - 1
+                accept_lens_cpu = final_path_lens_cpu
 
-        self.accept_index = self.accept_index[self.accept_index != -1]
-        logits_output.next_token_logits = logits_output.next_token_logits[self.accept_index]
+                # The compact path may have shrunk, so gather it again before
+                # using it for logits, hidden states, and KV bookkeeping.
+                compact_accept_index = self.accept_index[
+                    self.accept_index != -1
+                ]
+                compact_verified_id = self.predict[compact_accept_index]
+
+        self.accept_index = compact_accept_index
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            self.accept_index
+        ]
         if logits_output.hidden_states is not None:
-            logits_output.hidden_states = logits_output.hidden_states[self.accept_index]
-        self.verified_id = self.predict[self.accept_index]
+            logits_output.hidden_states = logits_output.hidden_states[
+                self.accept_index
+            ]
+        self.verified_id = compact_verified_id
+        return accept_lens_cpu
 
     def _free_cache(
         self, batch: ScheduleBatch, page_size: int, accept_length_cpu: torch.Tensor
@@ -1327,14 +1423,13 @@ class SpecBlockVerifyInput(SpecInput):
 
         Returns ``(logits_output, verified_id, accept_lens_cpu)``.
 
-        ``accept_lens_cpu`` is a [bs] int32 cpu tensor — counts of accepted
-        draft tokens per req (excluding the bonus).  Caller derives
-        ``accept_length_per_req_cpu = (accept_lens_cpu + 1).tolist()`` /
-        ``num_accepted_tokens = int(accept_lens_cpu.sum())``.
+        ``accept_lens_cpu`` is a [bs] int32 CPU tensor of bonus-inclusive
+        accepted path lengths. V1 creates it while compact accepted IDs are
+        finalized; V2 copies it after GPU-only path compaction.
 
-        Single sync point: the .cpu() copy is launched here (downstream
-        ops use the gpu-side ``self.accept_length``); caller's first
-        ``.tolist()`` / ``.sum().item()`` triggers the actual sync.
+        V1's host finalization synchronizes only the accepted-path IDs and
+        per-request lengths; KV and scheduler accounting reuse that length
+        tensor.
         """
         del vocab_mask  # SpecBlock-Shift currently has no grammar mask path
         bs = batch.batch_size()
@@ -1370,37 +1465,39 @@ class SpecBlockVerifyInput(SpecInput):
             )
 
         is_all_greedy = sampling_info.is_all_greedy
-        if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
-            logger.warning(
-                "[SpecBlockVerifyInput] tree spec sampling kernel "
-                "unavailable; falling back to greedy."
+        if not is_all_greedy and (not TREE_SPEC_KERNEL_AVAILABLE or _is_npu):
+            raise RuntimeError(
+                "SPECBLOCK_SHIFT sampling requires the tree speculative "
+                "sampling kernel on CUDA."
             )
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE or _is_npu:
+        if is_all_greedy:
             self._greedy_verify(batch, logits_output)
         else:
             self._sampling_verify(batch, logits_output, sampling_info)
 
         # V2 path: skip Python-side req.output_ids / check_finished updates.
         # V2 scheduler does them in process_batch_result_decode.
-        self._fill_requests(batch, logits_output, skip_finalize=skip_free_cache)
-        # Single async cpu transfer.  ``self.accept_length`` is # accepted
-        # *draft* tokens (excludes the bonus from target's argmax).  The
-        # scheduler V2 expects ``accept_lens`` to include the bonus token
-        # (accept_lens - 1 = spec accept count, see scheduler_output
-        # _processor_mixin.py:300).  So return ``accept_length + 1``.
-        accept_lens_cpu = (self.accept_length + 1).to("cpu", non_blocking=True)
-
+        accept_lens_cpu = self._fill_requests(
+            batch, logits_output, skip_finalize=skip_free_cache
+        )
         # V2 path skips _free_cache: the V2 plan-stream over-allocates
         # 2 * ALLOC_LEN_PER_DECODE per req (prepare_for_decode), and the
         # remainder stays in the pool until the req finishes — matches
         # EAGLE V2's pattern (eagle_worker_v2.py:682+ verify never calls
-        # _free_cache).  V1 path still frees rejected slots inline since
+        # _free_cache). V1 path still frees rejected slots inline since
         # V1 prepare_for_verify allocates exactly bs*draft_token_num.
-        if not skip_free_cache:
-            # V1 path: _free_cache expects accept_lens = accept_count
-            # (without bonus).  Recompute the gpu-only accept_length view.
-            accept_count_cpu = self.accept_length.to("cpu", non_blocking=True)
+        if skip_free_cache:
+            # V2 scheduler consumes bonus-inclusive lengths directly.
+            accept_lens_cpu = (self.accept_length + 1).to(
+                "cpu", non_blocking=True
+            )
+        else:
+            # _fill_requests has already copied the final bonus-inclusive
+            # lengths alongside compact verified IDs. Reuse that transfer for
+            # V1 KV accounting rather than making another D2H copy.
+            assert accept_lens_cpu is not None
+            accept_count_cpu = accept_lens_cpu - 1
             self._free_cache(batch, page_size, accept_count_cpu)
 
         batch.seq_lens.add_(self.accept_length + 1)

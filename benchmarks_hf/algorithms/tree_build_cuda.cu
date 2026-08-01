@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 
@@ -469,7 +470,8 @@ __global__ void build_tree_bfs_kernel(
     int MAX_TOPK,
     int GIVE_UP_CLASS,
     int ADAPTIVE_ALL_MODE,
-    int PEND_DEPTH)
+    int PEND_DEPTH,
+    int64_t tree_capacity)
 {
     const int leaf = blockIdx.x;
     if (leaf >= N || threadIdx.x != 0) return;
@@ -520,12 +522,14 @@ __global__ void build_tree_bfs_kernel(
         cum_glp[k] = running;
 
         const int64_t pos = chain_base + (int64_t)k;
-        tree_tokens[pos]  = my_gts[k];
-        tree_parents[pos] = (k == 0) ? pend_node : (pos - 1);
-        tree_lps[pos]     = pend_lp + cum_glp[k];
-        tree_ranks[pos]   = my_ranks[k];
-        tree_blocks[pos]  = (int64_t)PEND_DEPTH;
-        tree_slots[pos]   = (int64_t)k;
+        if (pos < tree_capacity) {
+            tree_tokens[pos]  = my_gts[k];
+            tree_parents[pos] = (k == 0) ? pend_node : (pos - 1);
+            tree_lps[pos]     = pend_lp + cum_glp[k];
+            tree_ranks[pos]   = my_ranks[k];
+            tree_blocks[pos]  = (int64_t)PEND_DEPTH;
+            tree_slots[pos]   = (int64_t)k;
+        }
     }
 
     // 3. Alternatives
@@ -545,12 +549,14 @@ __global__ void build_tree_bfs_kernel(
             const int64_t tok = top_target_all[(leaf * K + k) * MAX_TOPK + j];
             const float   lp  = pend_lp + parent_lp + top_lps_all[(leaf * K + k) * MAX_TOPK + j];
 
-            tree_tokens[pos]  = tok;
-            tree_parents[pos] = parent_node;
-            tree_lps[pos]     = lp;
-            tree_ranks[pos]   = rank_k;
-            tree_blocks[pos]  = (int64_t)PEND_DEPTH;
-            tree_slots[pos]   = (int64_t)k;
+            if (pos < tree_capacity) {
+                tree_tokens[pos]  = tok;
+                tree_parents[pos] = parent_node;
+                tree_lps[pos]     = lp;
+                tree_ranks[pos]   = rank_k;
+                tree_blocks[pos]  = (int64_t)PEND_DEPTH;
+                tree_slots[pos]   = (int64_t)k;
+            }
 
             cum_alt += 1;
         }
@@ -588,7 +594,9 @@ void build_tree_block1_cuda(
     int64_t ADAPTIVE_SLOT0_MODE,
     int64_t ADAPTIVE_ALL_MODE)
 {
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(tree_tokens.is_cuda(), "tree buffers must be CUDA tensors");
+    c10::cuda::CUDAGuard device_guard(tree_tokens.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(tree_tokens.get_device());
     build_tree_block1_kernel<<<1, 1, 0, stream>>>(
         rank_preds.data_ptr<int64_t>(),
         greedy_target.data_ptr<int64_t>(),
@@ -643,7 +651,9 @@ void build_tree_block1_fixed_n_cuda(
     int64_t ADAPTIVE_ALL_MODE,
     int64_t FIXED_N)
 {
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(tree_tokens.is_cuda(), "tree buffers must be CUDA tensors");
+    c10::cuda::CUDAGuard device_guard(tree_tokens.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(tree_tokens.get_device());
     build_tree_block1_fixed_n_kernel<<<1, 1, 0, stream>>>(
         rank_preds.data_ptr<int64_t>(),
         greedy_target.data_ptr<int64_t>(),
@@ -696,7 +706,9 @@ void build_tree_bfs_cuda(
     int64_t ADAPTIVE_ALL_MODE,
     int64_t PEND_DEPTH)
 {
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(tree_tokens.is_cuda(), "tree buffers must be CUDA tensors");
+    c10::cuda::CUDAGuard device_guard(tree_tokens.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(tree_tokens.get_device());
     build_tree_bfs_kernel<<<(int)N, 1, 0, stream>>>(
         all_rank_preds.data_ptr<int64_t>(),
         all_greedy_target.data_ptr<int64_t>(),
@@ -719,7 +731,8 @@ void build_tree_bfs_cuda(
         (int)MAX_TOPK,
         (int)GIVE_UP_CLASS,
         (int)ADAPTIVE_ALL_MODE,
-        (int)PEND_DEPTH);
+        (int)PEND_DEPTH,
+        (int64_t)tree_tokens.numel());
 }
 
 

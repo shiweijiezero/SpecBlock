@@ -1,7 +1,7 @@
 """
 SpecBlock Inference Model with KV Cache
 
-Inference model with KV cache and rank head:
+推理专用模型，基于 DiffSpec Inference Model 扩展：
 1. 增加 rank_head 输出
 2. 增加 use_draft_condition 支持多 block TTT
 3. 增加 ttt_cache 支持同一 position 跨 block 的 all-K-slots KV 缓存 + variable mask
@@ -43,6 +43,28 @@ except ImportError:
     _SGL_KERNEL_AVAILABLE = False
     _sgl_apply_rope = None
     _sgl_fused_add_rmsnorm = None
+
+
+_GROUPED_BMM = None
+
+
+def _grouped_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Apply one shared linear weight per request with request-major reduction."""
+    if not isinstance(weight, torch.Tensor):
+        raise TypeError("grouped block-2 linear requires an unquantized tensor weight")
+    if x.ndim < 3:
+        raise ValueError("grouped block-2 activations must start with request dimension")
+    requests = x.shape[0]
+    flat = x.reshape(requests, -1, x.shape[-1])
+    shared_weight = weight.t().unsqueeze(0).expand(requests, -1, -1)
+    global _GROUPED_BMM
+    if _GROUPED_BMM is None:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+            bmm_batch_invariant,
+        )
+        _GROUPED_BMM = bmm_batch_invariant
+    output = _GROUPED_BMM(flat, shared_weight)
+    return output.view(*x.shape[:-1], weight.shape[0])
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -281,14 +303,27 @@ class SpecBlockInputLayer(nn.Module):
         combined = torch.cat([cond, tok, query], dim=-1)  # [B, K, 3H]
         return self.fuse(combined)
 
-    def forward_batch(self, hidden_3h, input_ids):
-        """Batch N positions: [B, N, 3H] → [B, N*K, H] (always target condition)"""
-        B, N, _ = hidden_3h.shape
-        K, H = self.K, self.H
-        dtype = hidden_3h.dtype
+    def forward_block2_grouped(self, hidden, input_ids):
+        """Fuse padded request-major block-2 leaves with grouped BMM."""
+        requests, max_leaves = hidden.shape[:2]
+        dtype = hidden.dtype
+        cond = self.condition_norm(hidden).expand(-1, -1, self.K, -1)
+        tok = self.embed_tokens(input_ids).to(dtype)
+        tok = self.token_norm(tok).expand(-1, -1, self.K, -1)
+        query = self.position_queries.weight[None, None].expand(
+            requests, max_leaves, -1, -1,
+        )
+        query = self.query_norm(query)
+        combined = torch.cat([cond, tok, query], dim=-1)
+        return _grouped_linear(combined, self.fuse.weight)
 
-        cond = self.condition_proj(hidden_3h)
-        cond = self.condition_norm(cond).unsqueeze(2).expand(-1, -1, K, -1)
+    def forward_batch_from_condition(self, condition, input_ids):
+        """Batch N projected conditions: [B, N, H] → [B, N*K, H]."""
+        B, N, _ = condition.shape
+        K, H = self.K, self.H
+        dtype = condition.dtype
+
+        cond = self.condition_norm(condition).unsqueeze(2).expand(-1, -1, K, -1)
         tok = self.embed_tokens(input_ids).to(dtype)
         tok = self.token_norm(tok).unsqueeze(2).expand(-1, -1, K, -1)
         query = self.position_queries.weight[None, None].expand(B, N, -1, -1)
@@ -298,6 +333,12 @@ class SpecBlockInputLayer(nn.Module):
         combined = torch.cat([cond, tok, query], dim=-1)  # [B, N, K, 3H]
         out = self.fuse(combined)
         return out.reshape(B, N * K, H)
+
+    def forward_batch(self, hidden_3h, input_ids):
+        """Batch N positions: [B, N, 3H] → [B, N*K, H]."""
+        return self.forward_batch_from_condition(
+            self.condition_proj(hidden_3h), input_ids
+        )
 
 
 # ============================================================
@@ -348,7 +389,7 @@ class SpecBlockAttentionWithCache(nn.Module):
         Lazily builds a fused weight on first fast-path call. Falls back to
         separate projections if bf16/fp16 fused weight can't be used.
 
-        Dual-GPU fix: rebuild if device mismatch.
+        Dual-GPU fix (2026-04-24 Day 24): rebuild if device mismatch.
         `.to(device)` on nn.Module moves params + buffers but NOT arbitrary
         cached attributes like `self._qkv_weight`. When draft_train is
         .to(cuda:1) for dual-GPU training, this cache stays on cuda:0 →
@@ -378,6 +419,21 @@ class SpecBlockAttentionWithCache(nn.Module):
         k = qkv[..., q_out:q_out + k_out]
         v = qkv[..., q_out + k_out:]
         return q, k, v
+
+    def _qkv_proj_grouped(self, x):
+        """Packed QKV projection with one fixed-reduction BMM batch per request."""
+        if self._qkv_weight is None or self._qkv_weight.device != x.device:
+            self._qkv_weight = torch.cat([
+                self.q_proj.weight, self.k_proj.weight, self.v_proj.weight,
+            ], dim=0).contiguous()
+        qkv = _grouped_linear(x, self._qkv_weight)
+        q_out = self._q_out
+        k_out = self._k_out
+        return (
+            qkv[..., :q_out],
+            qkv[..., q_out:q_out + k_out],
+            qkv[..., q_out + k_out:],
+        )
 
     def _get_causal_mask(self, device):
         if self._causal_mask is None or self._causal_mask.device != device:
@@ -713,6 +769,134 @@ class SpecBlockAttentionWithCache(nn.Module):
             _PROFILE_EVENTS.append(("o_proj", _ev_op_s, _ev_op_e))
         return out_proj, (all_k, all_v)
 
+    def forward_block2_ragged(
+        self,
+        x,
+        cross_cache,
+        pos_ids,
+        max_position: int,
+        ttt_cache,
+        ttt_mask,
+        leaf_owner,
+        max_cross_count: int,
+    ):
+        """Forward flat block-2 leaves against request-owned cross/TTT KV."""
+        leaves, slots, _ = x.shape
+        q_flat, k_flat, v_flat = self._qkv_proj(x)
+        rope_len = int(max_position) + 1
+        use_fused_rope = (
+            _SGL_KERNEL_AVAILABLE
+            and _sgl_apply_rope is not None
+            and q_flat.is_cuda
+            and q_flat.dtype in (torch.bfloat16, torch.float16)
+            and os.environ.get("ROPE_FUSED", "1") == "1"
+        )
+        if use_fused_rope:
+            cos_sin_cache = self.rope.get_sgl_cos_sin_cache(rope_len, q_flat.device)
+            _sgl_apply_rope(
+                positions=pos_ids.reshape(-1),
+                query=q_flat.view(leaves * slots, self.n_heads * self.head_dim),
+                key=k_flat.view(leaves * slots, self.n_kv_heads * self.head_dim),
+                head_size=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=True,
+            )
+            q = q_flat.view(leaves, slots, self.n_heads, self.head_dim).transpose(1, 2)
+            k = k_flat.view(leaves, slots, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = v_flat.view(leaves, slots, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        else:
+            q = q_flat.view(leaves, slots, self.n_heads, self.head_dim).transpose(1, 2)
+            k = k_flat.view(leaves, slots, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = v_flat.view(leaves, slots, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            cos, sin = self.rope(rope_len, dtype=q.dtype, device=q.device)
+            q, k = apply_rope(q, k, cos, sin, pos_ids)
+
+        from .tree_attention_triton import ragged_three_part_attention
+        out = ragged_three_part_attention(
+            q,
+            cross_cache[0],
+            cross_cache[1],
+            cross_cache[2],
+            leaf_owner,
+            ttt_cache[0],
+            ttt_cache[1],
+            ttt_mask,
+            k,
+            v,
+            max_cross_count=max_cross_count,
+            k_slots=slots,
+            n_kv_groups=self.n_kv_groups,
+            scale=self.scale,
+        )
+        out = out.transpose(1, 2).contiguous().view(leaves, slots, -1)
+        return self.o_proj(out), (k, v)
+
+    def forward_block2_grouped(
+        self,
+        x,
+        cross_cache,
+        pos_ids,
+        max_position: int,
+        ttt_cache,
+        ttt_mask,
+        leaf_owner,
+        max_cross_count: int,
+    ):
+        """Forward padded request-major leaves while preserving scalar GEMM rows."""
+        requests, max_leaves, slots, _ = x.shape
+        leaves = requests * max_leaves
+        q_flat, k_flat, v_flat = self._qkv_proj_grouped(x)
+        rope_len = int(max_position) + 1
+        use_fused_rope = (
+            _SGL_KERNEL_AVAILABLE
+            and _sgl_apply_rope is not None
+            and q_flat.is_cuda
+            and q_flat.dtype in (torch.bfloat16, torch.float16)
+            and os.environ.get("ROPE_FUSED", "1") == "1"
+        )
+        if use_fused_rope:
+            cos_sin_cache = self.rope.get_sgl_cos_sin_cache(rope_len, q_flat.device)
+            _sgl_apply_rope(
+                positions=pos_ids.reshape(-1),
+                query=q_flat.reshape(leaves * slots, self.n_heads * self.head_dim),
+                key=k_flat.reshape(leaves * slots, self.n_kv_heads * self.head_dim),
+                head_size=self.head_dim,
+                cos_sin_cache=cos_sin_cache,
+                is_neox=True,
+            )
+            q = q_flat.reshape(leaves, slots, self.n_heads, self.head_dim).transpose(1, 2)
+            k = k_flat.reshape(leaves, slots, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = v_flat.reshape(leaves, slots, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        else:
+            q = q_flat.reshape(leaves, slots, self.n_heads, self.head_dim).transpose(1, 2)
+            k = k_flat.reshape(leaves, slots, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            v = v_flat.reshape(leaves, slots, self.n_kv_heads, self.head_dim).transpose(1, 2)
+            cos, sin = self.rope(rope_len, dtype=q.dtype, device=q.device)
+            q, k = apply_rope(q, k, cos, sin, pos_ids.reshape(leaves, slots))
+
+        from .tree_attention_triton import ragged_three_part_attention
+        out = ragged_three_part_attention(
+            q,
+            cross_cache[0],
+            cross_cache[1],
+            cross_cache[2],
+            leaf_owner,
+            ttt_cache[0],
+            ttt_cache[1],
+            ttt_mask.reshape(leaves, -1),
+            k,
+            v,
+            max_cross_count=max_cross_count,
+            k_slots=slots,
+            n_kv_groups=self.n_kv_groups,
+            scale=self.scale,
+        )
+        out = out.transpose(1, 2).contiguous().view(
+            requests, max_leaves, slots, -1,
+        )
+        projected = _grouped_linear(out, self.o_proj.weight)
+        return projected, (k, v)
+
     def forward_batch(self, x, cache, pos_ids, max_position: int, N: int,
                       return_last_kv: bool = False):
         """Batch forward for N positions (prefill/cache update). No TTT cache.
@@ -834,6 +1018,82 @@ class SpecBlockAttentionWithCache(nn.Module):
         if return_last_kv:
             return result, last_kv
         return result
+
+    def forward_batch_ragged(
+        self,
+        x,
+        cache,
+        pos_ids,
+        max_position: int,
+        N: int,
+        valid_lengths: torch.Tensor,
+        max_total_slots: int,
+        return_last_kv: bool = False,
+    ):
+        """Batch request rows with distinct cache and valid query lengths."""
+        B, NK, _ = x.shape
+        K = self.K
+        valid_slots = valid_lengths * K
+
+        q_flat, k_flat, v_flat = self._qkv_proj(x)
+        q = q_flat.view(B, NK, self.n_heads, self.head_dim).transpose(1, 2)
+        k_pre = k_flat.view(B, NK, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v_pre = v_flat.view(B, NK, self.n_kv_heads, self.head_dim).transpose(1, 2)
+
+        rope_len = max_position + 1
+        cos, sin = self.rope(rope_len, dtype=q.dtype, device=q.device)
+        q, k_pre = apply_rope(q, k_pre, cos, sin, pos_ids)
+
+        needed = int(max_total_slots)
+        if cache[0] is None:
+            capacity = max(int(cache[3]), needed)
+            cache[0] = torch.zeros(
+                B, self.n_kv_heads, capacity, self.head_dim,
+                device=k_pre.device, dtype=k_pre.dtype,
+            )
+            cache[1] = torch.zeros_like(cache[0])
+        elif needed > cache[0].shape[2]:
+            capacity = max(cache[0].shape[2] * 2, needed)
+            new_k = torch.zeros(
+                B, self.n_kv_heads, capacity, self.head_dim,
+                device=k_pre.device, dtype=k_pre.dtype,
+            )
+            new_v = torch.zeros_like(new_k)
+            new_k[:, :, :cache[0].shape[2], :].copy_(cache[0])
+            new_v[:, :, :cache[1].shape[2], :].copy_(cache[1])
+            cache[0], cache[1], cache[3] = new_k, new_v, capacity
+
+        from .draft_kv_triton import append_ragged_kv_
+        append_ragged_kv_(
+            cache[0], cache[1], k_pre, v_pre, cache[2], valid_slots
+        )
+        from .tree_attention_triton import ragged_tree_attention
+        out = ragged_tree_attention(
+            q,
+            cache[0],
+            cache[1],
+            cache[2],
+            valid_slots,
+            needed,
+            K,
+            self.n_kv_groups,
+            self.scale,
+        )
+
+        result = self.o_proj(out.transpose(1, 2).contiguous().view(B, NK, -1))
+        if not return_last_kv:
+            return result
+
+        last_position = (valid_lengths - 1).clamp_min(0) * K
+        gather_slots = last_position[:, None] + torch.arange(
+            K, device=x.device, dtype=torch.long,
+        )[None, :]
+        gather_index = gather_slots[:, None, :, None].expand(
+            B, self.n_kv_heads, K, self.head_dim,
+        )
+        last_k = torch.gather(k_pre, 2, gather_index)
+        last_v = torch.gather(v_pre, 2, gather_index)
+        return result, (last_k, last_v)
 
     def forward_batch_graph_safe(self, x, cache, pos_ids, max_position: int, N: int,
                                  cross_mask=None):
@@ -960,6 +1220,38 @@ class MLP(nn.Module):
         gate.mul_(self.up_proj(x))  # in-place multiply
         return self.down_proj(gate)
 
+    def forward_grouped(self, x):
+        """Request-major MLP whose GEMM reductions match request-local calls."""
+        gate_w = self.gate_proj.weight
+        if not isinstance(gate_w, torch.Tensor):
+            raise TypeError("grouped block-2 MLP requires unquantized weights")
+        if (
+            _SGL_KERNEL_AVAILABLE
+            and x.is_cuda
+            and x.dtype in (torch.bfloat16, torch.float16)
+        ):
+            if self._gate_up_weight is None or self._gate_up_weight.device != x.device:
+                self._gate_up_weight = torch.cat(
+                    [self.gate_proj.weight, self.up_proj.weight], dim=0,
+                ).contiguous()
+            gate_up = _grouped_linear(x, self._gate_up_weight)
+            intermediate = self.gate_proj.out_features
+            out_shape = gate_up.shape[:-1] + (intermediate,)
+            gate_up_flat = gate_up.view(-1, 2 * intermediate)
+            out_flat = torch.empty(
+                gate_up_flat.shape[0],
+                intermediate,
+                dtype=gate_up.dtype,
+                device=gate_up.device,
+            )
+            _sgl_silu_and_mul(gate_up_flat, out_flat)
+            activated = out_flat.view(out_shape)
+        else:
+            gate = self.act(_grouped_linear(x, self.gate_proj.weight))
+            gate.mul_(_grouped_linear(x, self.up_proj.weight))
+            activated = gate
+        return _grouped_linear(activated, self.down_proj.weight)
+
 
 class SpecBlockDecoderLayer(nn.Module):
     def __init__(self, config):
@@ -1040,6 +1332,94 @@ class SpecBlockDecoderLayer(nn.Module):
                 x = x + self.mlp(self.post_attention_layernorm(x))
         return x, all_kv
 
+    def forward_block2_ragged(
+        self,
+        x,
+        cross_cache,
+        pos_ids,
+        max_position: int,
+        ttt_cache,
+        ttt_mask,
+        leaf_owner,
+        max_cross_count: int,
+    ):
+        """Forward heterogeneous block-2 leaves without mutating cross cache."""
+        residual = x
+        attn_out, all_kv = self.self_attn.forward_block2_ragged(
+            self.input_layernorm(x),
+            cross_cache,
+            pos_ids,
+            max_position,
+            ttt_cache,
+            ttt_mask,
+            leaf_owner,
+            max_cross_count,
+        )
+        use_fused_norm = (
+            _SGL_KERNEL_AVAILABLE
+            and _sgl_fused_add_rmsnorm is not None
+            and attn_out.is_cuda
+            and attn_out.dtype in (torch.bfloat16, torch.float16)
+            and os.environ.get("FUSED_ADD_NORM", "1") == "1"
+        )
+        if use_fused_norm:
+            shape = attn_out.shape
+            _sgl_fused_add_rmsnorm(
+                attn_out.view(-1, shape[-1]),
+                residual.view(-1, shape[-1]),
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
+            x = residual + self.mlp(attn_out)
+        else:
+            x = residual + attn_out
+            x = x + self.mlp(self.post_attention_layernorm(x))
+        return x, all_kv
+
+    def forward_block2_grouped(
+        self,
+        x,
+        cross_cache,
+        pos_ids,
+        max_position: int,
+        ttt_cache,
+        ttt_mask,
+        leaf_owner,
+        max_cross_count: int,
+    ):
+        """Grouped block-2 decoder layer with request-major GEMM reductions."""
+        residual = x
+        attn_out, all_kv = self.self_attn.forward_block2_grouped(
+            self.input_layernorm(x),
+            cross_cache,
+            pos_ids,
+            max_position,
+            ttt_cache,
+            ttt_mask,
+            leaf_owner,
+            max_cross_count,
+        )
+        use_fused_norm = (
+            _SGL_KERNEL_AVAILABLE
+            and _sgl_fused_add_rmsnorm is not None
+            and attn_out.is_cuda
+            and attn_out.dtype in (torch.bfloat16, torch.float16)
+            and os.environ.get("FUSED_ADD_NORM", "1") == "1"
+        )
+        if use_fused_norm:
+            shape = attn_out.shape
+            _sgl_fused_add_rmsnorm(
+                attn_out.view(-1, shape[-1]),
+                residual.view(-1, shape[-1]),
+                self.post_attention_layernorm.weight,
+                self.post_attention_layernorm.eps,
+            )
+            x = residual + self.mlp.forward_grouped(attn_out)
+        else:
+            x = residual + attn_out
+            x = x + self.mlp.forward_grouped(self.post_attention_layernorm(x))
+        return x, all_kv
+
     def forward_batch(self, x, cache, pos_ids, max_position: int, N: int,
                       return_last_kv: bool = False):
         """Batch forward (prefill/cache update). No TTT cache."""
@@ -1057,6 +1437,43 @@ class SpecBlockDecoderLayer(nn.Module):
             )
             return x + self.mlp(self.post_attention_layernorm(x))
 
+    def forward_batch_ragged(
+        self,
+        x,
+        cache,
+        pos_ids,
+        max_position: int,
+        N: int,
+        valid_lengths: torch.Tensor,
+        max_total_slots: int,
+        return_last_kv: bool = False,
+    ):
+        """Batch request rows with row-wise cache and query lengths."""
+        if return_last_kv:
+            attn_out, last_kv = self.self_attn.forward_batch_ragged(
+                self.input_layernorm(x),
+                cache,
+                pos_ids,
+                max_position,
+                N,
+                valid_lengths,
+                max_total_slots,
+                return_last_kv=True,
+            )
+            x = x + attn_out
+            x = x + self.mlp(self.post_attention_layernorm(x))
+            return x, last_kv
+        x = x + self.self_attn.forward_batch_ragged(
+            self.input_layernorm(x),
+            cache,
+            pos_ids,
+            max_position,
+            N,
+            valid_lengths,
+            max_total_slots,
+        )
+        return x + self.mlp(self.post_attention_layernorm(x))
+
     def forward_batch_graph_safe(self, x, cache, pos_ids, max_position: int, N: int,
                                  cross_mask=None):
         """Graph-safe batch forward. Returns (output, pre_gqa_kv)."""
@@ -1073,7 +1490,7 @@ class SpecBlockDecoderLayer(nn.Module):
 # ============================================================
 
 class _SpecBlockInferenceModelBase(nn.Module):
-    """Internal base class for SpecBlock inference with KV cache and rank head."""
+    """SpecBlock model for inference with KV cache and rank head."""
 
     def __init__(self, config):
         super().__init__()
@@ -1149,6 +1566,36 @@ class _SpecBlockInferenceModelBase(nn.Module):
             _PROFILE_EVENTS.append(("rh_matmul", _ev_mm_s, _ev_mm_e))
         return ret
 
+    def _rank_forward_grouped(
+        self,
+        normed: torch.Tensor,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute rank features and heads without merging request GEMM rows."""
+        rank_topk = int(os.environ.get("RANK_TOPK", "10"))
+        with torch.no_grad():
+            top_logits, _ = logits.detach().topk(rank_topk, dim=-1)
+            top_logits = top_logits.float()
+            top_lse = torch.logsumexp(top_logits, dim=-1, keepdim=True)
+            top10_logits = top_logits[..., :10]
+            top10_lp = top10_logits - top_lse
+            top10_p = top10_lp.exp()
+            gap_12 = top10_logits[..., 0:1] - top10_logits[..., 1:2]
+            gap_13 = top10_logits[..., 0:1] - top10_logits[..., 2:3]
+            gap_15 = top10_logits[..., 0:1] - top10_logits[..., 4:5]
+            cumprob_top1 = top10_p[..., 0:1]
+            top_lp = top_logits - top_lse
+            top_p = top_lp.exp()
+            entropy = -(top_p * top_lp).nan_to_num(0.0).sum(-1, keepdim=True)
+            rank_features = torch.cat(
+                [top10_lp, gap_12, gap_13, gap_15, cumprob_top1, entropy],
+                dim=-1,
+            ).to(normed.dtype)
+        rank_input = torch.cat([normed.detach(), rank_features], dim=-1)
+        rank_hidden = _grouped_linear(rank_input, self.rank_head[0].weight)
+        rank_hidden = F.silu(rank_hidden)
+        return _grouped_linear(rank_hidden, self.rank_head[2].weight)
+
     # ---- Single position: draft call (with norm + lm_head + rank_head) ----
 
     def forward_with_cache(self, hidden, input_ids, cache, position_id,
@@ -1218,6 +1665,139 @@ class _SpecBlockInferenceModelBase(nn.Module):
             _ev_rh_e = torch.cuda.Event(enable_timing=True); _ev_rh_e.record()
             _PROFILE_EVENTS.append(("fwd_rank_head", _ev_rh_s, _ev_rh_e))
 
+        return logits, rank_logits, draft_hidden, new_ttt_kv
+
+    def forward_block2_ragged(
+        self,
+        hidden,
+        input_ids,
+        cache,
+        pos_ids,
+        max_position: int,
+        ttt_cache,
+        ttt_mask,
+        leaf_owner,
+        max_cross_count: int,
+    ):
+        """Run all heterogeneous block-2 leaves in one model call."""
+        leaves = hidden.shape[0]
+        if hidden.shape[1] != 1 or input_ids.shape != (leaves, 1):
+            raise ValueError("block-2 ragged inputs must contain one position per leaf")
+        if pos_ids.shape != (leaves, self.K):
+            raise ValueError("block-2 position ids must have shape [leaves, K]")
+        if ttt_mask.shape != (leaves, self.K):
+            raise ValueError("block-2 TTT mask must have shape [leaves, K]")
+        if len(cache) != self.num_layers or len(ttt_cache) != self.num_layers:
+            raise ValueError("block-2 cache lists must have one entry per layer")
+        cross_lengths = cache[0][2]
+        requests = cross_lengths.numel()
+        if leaf_owner.shape != (leaves,) or leaf_owner.dtype != torch.long:
+            raise ValueError("leaf_owner must be a torch.long vector with one entry per leaf")
+        if not leaf_owner.is_contiguous() or not cross_lengths.is_contiguous():
+            raise ValueError("block-2 ragged metadata must be contiguous")
+        metadata_valid = (
+            (cross_lengths >= 0)
+            & (cross_lengths <= int(max_cross_count))
+        )
+        owner_valid = (leaf_owner >= 0) & (leaf_owner < requests)
+        torch._assert_async(
+            torch.all(metadata_valid) & torch.all(owner_valid),
+            "block-2 ragged metadata is outside request/cache bounds",
+        )
+
+        x = self.input_layer(hidden, input_ids, use_draft_condition=True)
+        new_ttt_kv = []
+        for layer_idx, layer in enumerate(self.layers):
+            if cache[layer_idx][2] is not cross_lengths:
+                raise ValueError("all block-2 draft layers must share cross lengths")
+            x, all_kv = layer.forward_block2_ragged(
+                x,
+                cache[layer_idx],
+                pos_ids,
+                max_position,
+                ttt_cache[layer_idx],
+                ttt_mask,
+                leaf_owner,
+                max_cross_count,
+            )
+            new_ttt_kv.append(all_kv)
+
+        draft_hidden = x
+        normed = self.norm(x)
+        logits = self.lm_head(normed)
+        rank_logits = self._rank_forward(normed, logits)
+        return logits, rank_logits, draft_hidden, new_ttt_kv
+
+    def forward_block2_grouped(
+        self,
+        hidden,
+        input_ids,
+        cache,
+        pos_ids,
+        max_position: int,
+        ttt_cache,
+        ttt_mask,
+        leaf_owner,
+        valid_leaf_mask,
+        max_cross_count: int,
+    ):
+        """Run padded request-major block-2 leaves in one model invocation."""
+        requests, max_leaves = hidden.shape[:2]
+        if hidden.shape[2] != 1 or input_ids.shape != (requests, max_leaves, 1):
+            raise ValueError(
+                "grouped block-2 inputs must have shape [requests, leaves, 1, ...]"
+            )
+        if pos_ids.shape != (requests, max_leaves, self.K):
+            raise ValueError(
+                "grouped block-2 position ids must have shape [requests, leaves, K]"
+            )
+        if ttt_mask.shape != (requests, max_leaves, self.K):
+            raise ValueError(
+                "grouped block-2 TTT mask must have shape [requests, leaves, K]"
+            )
+        if valid_leaf_mask.shape != (requests, max_leaves) or valid_leaf_mask.dtype != torch.bool:
+            raise ValueError("valid_leaf_mask must be boolean [requests, leaves]")
+        if len(cache) != self.num_layers or len(ttt_cache) != self.num_layers:
+            raise ValueError("grouped block-2 cache lists must have one entry per layer")
+        cross_lengths = cache[0][2]
+        if cross_lengths.shape != (requests,):
+            raise ValueError("grouped block-2 cross lengths must match request rows")
+        leaves = requests * max_leaves
+        if leaf_owner.shape != (leaves,) or leaf_owner.dtype != torch.long:
+            raise ValueError("leaf_owner must contain one request index per padded leaf")
+        if not leaf_owner.is_contiguous() or not cross_lengths.is_contiguous():
+            raise ValueError("grouped block-2 metadata must be contiguous")
+        metadata_valid = (
+            (cross_lengths > 0)
+            & (cross_lengths <= int(max_cross_count))
+        )
+        owner_valid = (leaf_owner >= 0) & (leaf_owner < requests)
+        torch._assert_async(
+            torch.all(metadata_valid) & torch.all(owner_valid),
+            "grouped block-2 metadata is outside request/cache bounds",
+        )
+
+        x = self.input_layer.forward_block2_grouped(hidden, input_ids)
+        new_ttt_kv = []
+        for layer_idx, layer in enumerate(self.layers):
+            if cache[layer_idx][2] is not cross_lengths:
+                raise ValueError("all grouped block-2 layers must share cross lengths")
+            x, all_kv = layer.forward_block2_grouped(
+                x,
+                cache[layer_idx],
+                pos_ids,
+                max_position,
+                ttt_cache[layer_idx],
+                ttt_mask,
+                leaf_owner,
+                max_cross_count,
+            )
+            new_ttt_kv.append(all_kv)
+
+        draft_hidden = x
+        normed = self.norm(x)
+        logits = _grouped_linear(normed, self.lm_head.weight)
+        rank_logits = self._rank_forward_grouped(normed, logits)
         return logits, rank_logits, draft_hidden, new_ttt_kv
 
     # ---- Batch N positions: prefill / cache update (no norm + lm_head) ----
@@ -1402,6 +1982,80 @@ class _SpecBlockInferenceModelBase(nn.Module):
             self.maybe_compact_near_to_far(cache, near_win)
 
         return logits, rank_logits, draft_hidden, new_ttt_kv, start_position + N
+
+    def update_cache_and_draft_ragged(
+        self,
+        hidden_3h,
+        input_ids,
+        cache,
+        start_positions: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        max_position: int,
+        max_total_slots: int,
+    ):
+        """Merged cache update and block-1 forward for heterogeneous requests."""
+        condition = self.input_layer.condition_proj(hidden_3h)
+        return self.update_cache_and_draft_ragged_from_condition(
+            condition,
+            input_ids,
+            cache,
+            start_positions,
+            valid_lengths,
+            max_position,
+            max_total_slots,
+        )
+
+    def update_cache_and_draft_ragged_from_condition(
+        self,
+        condition,
+        input_ids,
+        cache,
+        start_positions: torch.Tensor,
+        valid_lengths: torch.Tensor,
+        max_position: int,
+        max_total_slots: int,
+    ):
+        """Run ragged block-1 forward from an already projected condition."""
+        B, N, _ = condition.shape
+        K = self.K
+        valid_slots = valid_lengths * K
+        from .draft_kv_triton import assert_ragged_kv_metadata
+        assert_ragged_kv_metadata(
+            cache[0][2], valid_slots, N * K, max_total_slots,
+        )
+        x = self.input_layer.forward_batch_from_condition(condition, input_ids)
+
+        position_offsets = torch.arange(N, device=x.device, dtype=torch.long)
+        slot_offsets = torch.arange(K, device=x.device, dtype=torch.long)
+        pos_ids = (
+            start_positions[:, None, None]
+            + 1
+            + position_offsets[None, :, None]
+            + slot_offsets[None, None, :]
+        ).reshape(B, N * K)
+
+        new_ttt_kv = []
+        for layer_idx, layer in enumerate(self.layers):
+            x, last_kv = layer.forward_batch_ragged(
+                x,
+                cache[layer_idx],
+                pos_ids,
+                max_position,
+                N,
+                valid_lengths,
+                max_total_slots,
+                return_last_kv=True,
+            )
+            new_ttt_kv.append(last_kv)
+
+        last_position = (valid_lengths - 1).clamp_min(0) * K
+        gather_slots = last_position[:, None] + slot_offsets[None, :]
+        gather_index = gather_slots[:, :, None].expand(B, K, x.shape[-1])
+        draft_hidden = torch.gather(x, 1, gather_index)
+        normed = self.norm(draft_hidden)
+        logits = self.lm_head(normed)
+        rank_logits = self._rank_forward(normed, logits)
+        return logits, rank_logits, draft_hidden, new_ttt_kv
 
     # ---- Cache management ----
 

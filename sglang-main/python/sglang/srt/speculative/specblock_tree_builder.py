@@ -27,7 +27,7 @@ Reference line ranges in ``benchmarks_hf/algorithms/specblock.py``:
                                               (numpy fallback)
 
 Expected draft model interface (matches
-``SpecBlockInferenceModel.forward_with_cache``)::
+``SpecBlockShiftInferenceModel.forward_with_cache``)::
 
     logits, rank_logits, draft_hidden, new_ttt_kv = draft_model.forward_with_cache(
         hidden=...,             # [B, 1, 3H] block 1 / [B, 1, H] block 2+
@@ -68,14 +68,9 @@ _RANK_TO_FACTOR_DEFAULT = (0, 4, 10, 0)
 
 # Per-slot top-k branching count per rank class.
 #
-# HF Pareto baseline uses `SLOT_TOPK_MODE='slim_r2'` -> `(2, 4, 6, 4)`,
-# accompanied by `ADAPTIVE_SLOT0=1` + `ADAPTIVE_ALL=1` knobs that shrink
-# slot-0 / per-slot topk when the greedy slot probability is high.
-# Empirical: slim_r2 alone (without the adaptive knobs) **regresses** in
-# SGLang's numpy port (mtbench:80 bs=1 acc 3.78 vs default 4.27).  Hold
-# at default until the adaptive code paths are also ported, OR until the
-# SGLang numpy `_expand_block1` give_up handling at topk>0 is audited
-# against HF's CUDA path bit-for-bit.
+# The batched GPU path defaults to the measured Pareto point
+# `slim_r2` -> `(2, 4, 6, 4)`.  It preserves the useful alternatives while
+# keeping the root-inclusive target verify width small enough for bs>1.
 _RANK_SLOT_TOPK_DEFAULT_MAP = {
     'default':    (2, 4, 10, 0),
     'no_giveup':  (2, 4, 10, 4),
@@ -83,7 +78,7 @@ _RANK_SLOT_TOPK_DEFAULT_MAP = {
     'slim_r2b':   (2, 3, 5, 3),
 }
 _RANK_SLOT_TOPK_DEFAULT = _RANK_SLOT_TOPK_DEFAULT_MAP[
-    os.environ.get('SLOT_TOPK_MODE', 'default')
+    os.environ.get('SLOT_TOPK_MODE', 'slim_r2')
 ]
 
 # ADAPTIVE_SLOT0: shrink slot-0 beam (block-1 alternatives) based on greedy
@@ -485,15 +480,6 @@ def compute_slot_topks_bfs(
     return slot_topks_per_rank
 
 
-# ============================================================
-#  CUDA Graph cache for build_tree_batched phase-2 forward
-# ============================================================
-
-# Fail-fast: a single capture OOM disables graph globally for the
-# remainder of the process so we don't leak fragmented private-pool
-# allocations on every subsequent attempt.
-_BLOCK2_GRAPH_DISABLED = False
-
 # Fine-grained tree-builder profile state.  Filled when
 # SPECBLOCK_TREE_PROFILE=1.  Drained by the worker (after the existing
 # [SBSprof] print) at iter % 50 == 0 and reset.
@@ -505,337 +491,6 @@ _BUILDTREE_PROFILE_STATE: Dict[str, float] = {
     "b2_bfs": 0.0,
     "finalize": 0.0,
 }
-#
-#  Stage B: lazy multi-bucket cuda graph capture for the GPU-bottleneck
-#  block-2 forward inside build_tree_batched.  Each unique
-#  (total_pend, cross_bucket) shape gets a graph captured on first call.
-#  Subsequent calls with the same shape replay it.
-#
-#  cross_bucket is selected by bisect to the smallest power-of-2 >=
-#  actual max_cross_count.  Capture creates static tensors padded to
-#  cross_bucket; replay copies actual data into the static tensors then
-#  calls graph.replay().
-#
-#  Disabled via env SPECBLOCK_GRAPH=0 (default ON when supported).
-# ============================================================
-
-_GRAPH_CROSS_BUCKETS = (
-    # Stage B+ paged kernel (three_part_attention_paged) drops the dense
-    # cross_k intermediate so per-capture graph private pool is dominated
-    # by the *other* draft ops (qkv proj / mlp / lm_head ~ 1.5 GB).  4 bs
-    # × 5 buckets ≈ 30 GB, fits mem-fraction-static = 0.5.  Smaller
-    # buckets keep the kernel's inner cross loop tight (avoids the
-    # over-iterate slowdown observed with single bucket=2048: bs=4
-    # 0.60x vs eager 0.74x because actual cross_count typically ≪ 2048).
-    128, 256, 512, 1024, 2048,
-)
-_BLOCK2_GRAPH_CACHE: Dict[Tuple, Optional[Dict]] = {}
-
-
-def _pick_cross_bucket(cross_count: int) -> int:
-    """Return the smallest bucket >= cross_count, or -1 if exceeds max
-    bucket (signal caller to fall back to eager).
-    """
-    for b in _GRAPH_CROSS_BUCKETS:
-        if b >= cross_count:
-            return b
-    return -1  # exceeds; eager fallback
-
-
-def _block2_graph_replay_or_capture(
-    draft_model,
-    pend_hidden_b,
-    pend_input_ids_b,
-    batched_cross_cache,
-    pos_id_tensor,
-    batched_ttt_kv,
-    ttt_mask_b,
-    full_kv_mask_b,
-    K: int,
-    *,
-    enabled: bool,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Multi-bucket lazy cuda graph cache for the block-2 forward.
-
-    Uses ``forward_with_cache_graph`` (graph-safe API on
-    SpecBlockInferenceModel) which:
-      - takes pre-built ``pos_ids: [bs, K]`` tensor (no internal arange)
-      - takes constant ``rope_max_position`` (no host sync inside)
-      - update_cross_cache fixed False (no list mutation in graph)
-
-    Returns (block_logits, block_rank_logits).  Falls back to eager
-    forward_with_cache when graph disabled or capture fails.
-    """
-    tp = pend_hidden_b.shape[0]
-
-    def _eager_fwd():
-        block_logits, block_rank_logits, _h, _ttt = (
-            draft_model.forward_with_cache(
-                hidden=pend_hidden_b,
-                input_ids=pend_input_ids_b,
-                cache=batched_cross_cache,
-                position_id=pos_id_tensor,
-                use_draft_condition=True,
-                ttt_cache=batched_ttt_kv,
-                ttt_mask=ttt_mask_b,
-                update_cross_cache=False,
-                full_kv_mask=full_kv_mask_b,
-            )
-        )
-        return block_logits, block_rank_logits
-
-    global _BLOCK2_GRAPH_DISABLED
-    if not enabled or _BLOCK2_GRAPH_DISABLED:
-        return _eager_fwd()
-
-    # Stage B-paged: graph capture is paged-only (cross_loc tensor is
-    # the only data dep crossing capture/replay; pool buffer pointers
-    # are stable across replays as long as the pool does not grow).
-    is_paged = (
-        batched_cross_cache
-        and len(batched_cross_cache[0]) >= 5
-        and batched_cross_cache[0][0] is not None
-        and hasattr(batched_cross_cache[0][0], "set_kv")
-    )
-    if not is_paged:
-        # Dense input -- legacy path is being removed; fall back to
-        # eager.  All production worker calls now build paged caches.
-        return _eager_fwd()
-
-    cross_count = int(batched_cross_cache[0][2])
-    cross_bucket = _pick_cross_bucket(cross_count) if cross_count > 0 else 0
-    if cross_bucket < 0:
-        # Exceeds max bucket (>1024) -- eager fallback.  TODO: extend
-        # _GRAPH_CROSS_BUCKETS upward now that paged makes large
-        # buckets cheap (only int64 indices, no GB-class buffers).
-        return _eager_fwd()
-    num_layers = len(batched_cross_cache)
-    K_ttt = batched_ttt_kv[0][0].shape[2] if batched_ttt_kv else K
-    cache_key = (tp, cross_bucket, num_layers, K_ttt, K)
-
-    # Build [tp, K] pos_ids tensor from [tp] base positions (one-shot).
-    slot_offsets = torch.arange(K, device=pend_hidden_b.device, dtype=torch.long)
-    # pos_id_tensor is [tp] with each row = base position for that pend slot.
-    # Each row's K slots use base + 1 .. base + K.
-    pos_ids_2d = (pos_id_tensor.unsqueeze(1) + 1) + slot_offsets.unsqueeze(0)
-    rope_max_position = int(pos_id_tensor.max().item()) + K
-
-    if cache_key not in _BLOCK2_GRAPH_CACHE:
-        import logging
-        logger = logging.getLogger(__name__)
-        try:
-            _BLOCK2_GRAPH_CACHE[cache_key] = _capture_block2_graph_safe(
-                draft_model, tp, cross_bucket, num_layers, K_ttt, K,
-                pend_hidden_b, pend_input_ids_b, batched_cross_cache,
-                pos_ids_2d, batched_ttt_kv, ttt_mask_b, full_kv_mask_b,
-                rope_max_position,
-            )
-            logger.info(
-                f"[SpecBlock] block-2 cuda graph captured for "
-                f"key={cache_key} (cross_bucket={cross_bucket})."
-            )
-        except torch.cuda.OutOfMemoryError as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                f"[SpecBlock] block-2 cuda graph capture OOM for "
-                f"{cache_key}: {e}. Globally disabling graph capture for "
-                "the remainder of this process and clearing the cache."
-            )
-            _BLOCK2_GRAPH_CACHE.clear()
-            _BLOCK2_GRAPH_DISABLED = True
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-            return _eager_fwd()
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).warning(
-                f"[SpecBlock] block-2 cuda graph capture failed for "
-                f"{cache_key}: {type(e).__name__}: {e}. Falling back to eager."
-            )
-            _BLOCK2_GRAPH_CACHE[cache_key] = None
-
-    graph_state = _BLOCK2_GRAPH_CACHE[cache_key]
-    if graph_state is None:
-        return _eager_fwd()
-
-    # Replay (paged): copy actual cross_loc + masks + ttt KV into the
-    # captured static buffers, then replay.  cross_loc valid prefix is
-    # ``cross_count``; pad-region bytes are left as the sentinel zero
-    # index, which gathers slot 0 (the always-zero pool sentinel).
-    sin = graph_state["static_in"]
-    sout = graph_state["static_out"]
-    sin["hidden"].copy_(pend_hidden_b)
-    sin["input_ids"].copy_(pend_input_ids_b)
-    sin["pos_ids_2d"].copy_(pos_ids_2d)
-    sin["ttt_mask"].copy_(ttt_mask_b)
-    if cross_bucket > 0:
-        # batched_cross_cache[0][3] is the [tp, cross_count] paged loc
-        # (all layers share it).  Copy valid prefix; pad slots stay 0.
-        live_loc = batched_cross_cache[0][3]
-        sin["cross_loc"].zero_()
-        sin["cross_loc"][:, :cross_count].copy_(live_loc[:, :cross_count])
-        sin["full_kv_mask"].zero_()
-        sin["full_kv_mask"][:, :cross_count] = full_kv_mask_b[:, :cross_count]
-        sin["full_kv_mask"][:, cross_bucket:cross_bucket + K_ttt] = ttt_mask_b
-    else:
-        sin["full_kv_mask"].copy_(full_kv_mask_b)
-    for L in range(num_layers):
-        sin["ttt_k"][L].copy_(batched_ttt_kv[L][0])
-        sin["ttt_v"][L].copy_(batched_ttt_kv[L][1])
-
-    graph_state["graph"].replay()
-    return sout["block_logits"].clone(), sout["block_rank_logits"].clone()
-
-
-def _capture_block2_graph_safe(
-    draft_model,
-    tp: int,
-    cross_bucket: int,
-    num_layers: int,
-    K_ttt: int,
-    K: int,
-    pend_hidden_b,
-    pend_input_ids_b,
-    batched_cross_cache,
-    pos_ids_2d,
-    batched_ttt_kv,
-    ttt_mask_b,
-    full_kv_mask_b,
-    rope_max_position: int,
-) -> Dict:
-    """Allocate static buffers, warmup, capture forward_with_cache_graph.
-
-    Paged variant: replaces dense [tp, n_heads, bucket, D] static cross_k/v
-    buffers with a single [tp, bucket] int64 ``static_cross_loc`` indices
-    tensor.  Memory drops from ~GB/bucket to KB/bucket because the pool's
-    K/V buffers are reused across captures (PyTorch fancy indexing's
-    indirect data load is a stable graph op as long as the pool's
-    ``k_buffer``/``v_buffer`` pointers don't change between captures).
-
-    The pool MUST not grow during graph capture/replay; size accordingly
-    (env SPECBLOCK_KV_POOL_SIZE, default 16384) at worker init.
-    """
-    device = pend_hidden_b.device
-
-    # ---- Pool reference + dtype/shape derivation -----------------------
-    kv_pool = batched_cross_cache[0][0]
-    assert kv_pool is not None and hasattr(kv_pool, "set_kv"), (
-        "_capture_block2_graph_safe requires paged batched_cross_cache "
-        f"(layer[0][0] should be a SpecBlockKVPool); got {type(kv_pool).__name__}"
-    )
-
-    # ---- Allocate static input buffers --------------------------------
-    static_hidden = torch.zeros_like(pend_hidden_b)
-    static_input_ids = torch.zeros_like(pend_input_ids_b)
-    static_pos_ids_2d = torch.zeros_like(pos_ids_2d)
-    static_ttt_mask = torch.zeros_like(ttt_mask_b)
-
-    if cross_bucket > 0:
-        # [tp, cross_bucket] int64 indices.  Pad with 0 (pool sentinel
-        # slot, always zero K/V) -- masked out by full_kv_mask.
-        static_cross_loc = torch.zeros(
-            tp, cross_bucket, dtype=torch.int64, device=device,
-        )
-        static_cache_layers = [
-            [kv_pool, L, cross_bucket, static_cross_loc, None]
-            for L in range(num_layers)
-        ]
-        static_full_kv_mask = torch.zeros(
-            tp, cross_bucket + K_ttt, dtype=torch.bool, device=device,
-        )
-    else:
-        # Empty cross context.  Single sentinel slot keeps the gather
-        # well-defined; mask zero-fills its softmax contribution.
-        static_cross_loc = torch.zeros(
-            tp, 1, dtype=torch.int64, device=device,
-        )
-        static_cache_layers = [
-            [kv_pool, L, 0, static_cross_loc, None] for L in range(num_layers)
-        ]
-        static_full_kv_mask = torch.zeros_like(full_kv_mask_b)
-
-    static_ttt_k = [
-        torch.zeros_like(batched_ttt_kv[L][0]) for L in range(num_layers)
-    ]
-    static_ttt_v = [
-        torch.zeros_like(batched_ttt_kv[L][1]) for L in range(num_layers)
-    ]
-    static_ttt_kv = [
-        (static_ttt_k[L], static_ttt_v[L]) for L in range(num_layers)
-    ]
-
-    # Initial copy from real data so warmup runs valid math.
-    static_hidden.copy_(pend_hidden_b)
-    static_input_ids.copy_(pend_input_ids_b)
-    static_pos_ids_2d.copy_(pos_ids_2d)
-    static_ttt_mask.copy_(ttt_mask_b)
-    for L in range(num_layers):
-        static_ttt_k[L].copy_(batched_ttt_kv[L][0])
-        static_ttt_v[L].copy_(batched_ttt_kv[L][1])
-    if cross_bucket > 0:
-        cross_count = int(batched_cross_cache[0][2])
-        live_loc = batched_cross_cache[0][3]
-        if cross_count > 0:
-            static_cross_loc[:, :cross_count].copy_(live_loc[:, :cross_count])
-        static_full_kv_mask[:, :cross_count] = (
-            full_kv_mask_b[:, :cross_count]
-        )
-        static_full_kv_mask[:, cross_bucket:cross_bucket + K_ttt] = ttt_mask_b
-    else:
-        static_full_kv_mask.copy_(full_kv_mask_b)
-
-    # Warmup using the graph-safe API so any one-shot allocations / Triton
-    # autotune happens outside the capture.
-    for _ in range(2):
-        torch.cuda.synchronize()
-        _ = draft_model.forward_with_cache_graph(
-            hidden=static_hidden,
-            input_ids=static_input_ids,
-            pos_ids=static_pos_ids_2d,
-            cache=static_cache_layers,
-            rope_max_position=rope_max_position,
-            ttt_cache=static_ttt_kv,
-            ttt_mask=static_ttt_mask,
-            full_kv_mask=static_full_kv_mask,
-        )
-    torch.cuda.synchronize()
-
-    # Capture
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured_logits, captured_rank, _h, _ttt = (
-            draft_model.forward_with_cache_graph(
-                hidden=static_hidden,
-                input_ids=static_input_ids,
-                pos_ids=static_pos_ids_2d,
-                cache=static_cache_layers,
-                rope_max_position=rope_max_position,
-                ttt_cache=static_ttt_kv,
-                ttt_mask=static_ttt_mask,
-                full_kv_mask=static_full_kv_mask,
-            )
-        )
-
-    return {
-        "graph": graph,
-        "static_in": {
-            "hidden": static_hidden,
-            "input_ids": static_input_ids,
-            "pos_ids_2d": static_pos_ids_2d,
-            "ttt_mask": static_ttt_mask,
-            "cross_loc": static_cross_loc,
-            "ttt_k": static_ttt_k,
-            "ttt_v": static_ttt_v,
-            "full_kv_mask": static_full_kv_mask,
-        },
-        "static_out": {
-            "block_logits": captured_logits,
-            "block_rank_logits": captured_rank,
-        },
-    }
-
 
 def _walk_rank_slots(
     rank_preds: torch.Tensor,        # [N, K]
@@ -1503,11 +1158,14 @@ def build_tree(
         # count, cross_loc, new_cross_loc=None], with cross_loc shared
         # across layers within a request.
         kv_pool = cross_kv_cache[0][0]
-        count = int(cross_kv_cache[0][2])
+        stored_count = int(cross_kv_cache[0][2])
+        # Current block-0's final K slots belong to the path-specific TTT
+        # region.  Keep only older committed positions in full cross context.
+        count = max(stored_count - K, 0)
         cross_loc_1d = cross_kv_cache[0][3]
         if count > 0:
             loc_expanded = (
-                cross_loc_1d.unsqueeze(0).expand(N_pend, -1).contiguous()
+                cross_loc_1d[:count].unsqueeze(0).expand(N_pend, -1).contiguous()
             )
         else:
             sentinel_device = (
@@ -1653,6 +1311,8 @@ def build_tree_batched(
     rank_to_factor: Optional[Tuple[int, ...]] = None,
     rank_slot_topk: Optional[Tuple[int, ...]] = None,
     d2t: Optional[torch.Tensor] = None,
+    need_retrieve_index: bool = True,
+    block1_top_indices_b: Optional[torch.Tensor] = None,
 ) -> List[Dict[str, torch.Tensor]]:
     """Batched version of :func:`build_tree`.
 
@@ -1721,6 +1381,8 @@ def build_tree_batched(
             rank_slot_topk=tuple(rank_slot_topk),
             rank_to_factor=tuple(rank_to_factor),
             d2t=d2t, scratch_b=scratch_b,
+            need_retrieve_index=need_retrieve_index,
+            block1_top_indices_b=block1_top_indices_b,
         )
 
     # ---- CPU dev path (numpy reference; not used in production) ----
@@ -1924,17 +1586,7 @@ def _batched_block2_forward(
         return
 
     if n_pend_max is None:
-        # Stage B graph mode: pin n_pend_max to N_PEND_MAX_DEFAULT so
-        # the (tp = B * n_pend_max) cache_key is stable across decode
-        # iterations.  Without this every step's actual_max(N_pend)
-        # change triggers a fresh capture, and the per-capture warmup
-        # cost dominates throughput (observed: 0.58x vs 0.74x graph=0).
-        # Eager mode stays variable to avoid wasting compute on pad
-        # rows when no capture amortises the overhead.
-        if os.environ.get("SPECBLOCK_GRAPH", "1") == "1":
-            n_pend_max = max(N_PEND_MAX_DEFAULT, max(N_pend_per_req))
-        else:
-            n_pend_max = max(N_pend_per_req)
+        n_pend_max = max(N_pend_per_req)
     else:
         n_pend_max = max(n_pend_max, max(N_pend_per_req))
     total_pend = B * n_pend_max
@@ -1991,7 +1643,11 @@ def _batched_block2_forward(
     # Each req's paged cache layer has the layout:
     #   [kv_pool, layer_id, count, cross_loc, new_cross_loc=None]
     # All layers within a req share the same cross_loc tensor.
-    cross_counts = [int(cross_kv_cache_b[b][0][2]) for b in range(B)]
+    # Each paged cache ends with the current block-0 K slots.  Those slots
+    # must remain path-specific TTT context, not globally visible cross KV.
+    cross_counts = [
+        max(int(cross_kv_cache_b[b][0][2]) - K, 0) for b in range(B)
+    ]
     max_cross_count = max(cross_counts)
     kv_pool = cross_kv_cache_b[0][0][0]
     assert kv_pool is not None and hasattr(kv_pool, "set_kv"), (
@@ -2008,15 +1664,14 @@ def _batched_block2_forward(
         for b in range(B):
             cnt = cross_counts[b]
             cross_loc_b_t = cross_kv_cache_b[b][0][3]  # layer-shared
+            real_loc = cross_loc_b_t[:cnt].to(device, dtype=torch.int64)
             if cnt == max_cross_count:
-                loc_per_b.append(cross_loc_b_t.to(device, dtype=torch.int64))
+                loc_per_b.append(real_loc)
             else:
                 pad = torch.zeros(
                     max_cross_count - cnt, dtype=torch.int64, device=device,
                 )
-                loc_b_padded = torch.cat(
-                    [cross_loc_b_t.to(device, dtype=torch.int64), pad], dim=0
-                )
+                loc_b_padded = torch.cat([real_loc, pad], dim=0)
                 loc_per_b.append(loc_b_padded)
         loc_padded_b = torch.stack(loc_per_b, dim=0)  # [B, max_cross_count]
         # Expand to [B*n_pend_max, max_cross_count] for the pend forward.
@@ -2104,31 +1759,21 @@ def _batched_block2_forward(
         torch.cuda.synchronize()
         _b2_t_plan = _b2_time.perf_counter()
 
-    # ONE batched forward (fixed shape B*n_pend_max).  Stage B: replay
-    # captured cuda graph for this (tp, cross_bucket) shape if available;
-    # falls back to eager forward when cuda graph disabled or unsupported.
-    graph_enabled = (
-        # Default OFF: even with the paged kernel + multi-bucket capture
-        # (no OOM, all captures fit), graph replay is 15-25% slower than
-        # eager because (a) bucket-aligned cross_count over-iterates the
-        # kernel inner loop ~1.5x and (b) paged indirect load is more
-        # cache-miss prone than the dense stride-0 broadcast access in
-        # the eager path.  Keep eager as production; revisit when the
-        # attention is migrated to flashinfer's paged kernel (Stage D).
-        os.environ.get("SPECBLOCK_GRAPH", "0") == "1"
-        and pend_hidden_b.is_cuda
-    )
-    block_logits_b, block_rank_logits_b = _block2_graph_replay_or_capture(
-        draft_model,
-        pend_hidden_b,
-        pend_input_ids_b,
-        batched_cross_cache,
-        pos_id_tensor,
-        batched_ttt_kv,
-        ttt_mask_b,
-        full_kv_mask_b,
-        K=K,
-        enabled=graph_enabled,
+    # This batched builder is no longer a production worker route.  Keep its
+    # direct forward for offline diagnostics only; the worker's sole draft
+    # execution path is SpecBlockDraftCudaGraphRunner.
+    block_logits_b, block_rank_logits_b, _hidden, _ttt = (
+        draft_model.forward_with_cache(
+            hidden=pend_hidden_b,
+            input_ids=pend_input_ids_b,
+            cache=batched_cross_cache,
+            position_id=pos_id_tensor,
+            use_draft_condition=True,
+            ttt_cache=batched_ttt_kv,
+            ttt_mask=ttt_mask_b,
+            update_cross_cache=False,
+            full_kv_mask=full_kv_mask_b,
+        )
     )
 
     if _b2_deep:

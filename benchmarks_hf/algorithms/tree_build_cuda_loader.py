@@ -15,6 +15,26 @@ import torch
 
 _MOD = None
 _MOD_LOCK = threading.Lock()
+_TREE_FIELDS = ("tokens", "parents", "lps", "ranks", "blocks", "slots")
+
+
+def _tree_buffer_capacity(tree_buf: dict) -> int:
+    capacities = {int(tree_buf[name].numel()) for name in _TREE_FIELDS}
+    if len(capacities) != 1:
+        raise ValueError("CUDA tree buffers must have identical capacities")
+    return capacities.pop()
+
+
+def tree_bfs_required_capacity(
+    tree_start: int,
+    leaves: int,
+    K: int,
+    max_topk: int,
+) -> int:
+    values = (tree_start, leaves, K, max_topk)
+    if tree_start < 0 or leaves < 0 or K <= 0 or max_topk <= 0:
+        raise ValueError(f"invalid CUDA BFS dimensions: {values}")
+    return tree_start + leaves * K * max_topk
 
 
 def _get_module():
@@ -99,6 +119,15 @@ def cuda_build_block1_fixed_n(
     but N_real is informational — caller treats N_pend = fixed_n always.
     No host sync is required on sizes_buf[3] for the pipeline to proceed.
     """
+    if fixed_n <= 0:
+        raise ValueError("fixed-N CUDA tree builder requires fixed_n > 0")
+    required_block1 = K + K * (max_topk - 1) + 1
+    if _tree_buffer_capacity(tree_buf) < required_block1:
+        raise ValueError("CUDA tree buffer is too small for block-1 output")
+    if any(int(pend_buf[name].numel()) < fixed_n for name in (
+        "hidden_slots", "input_ids", "ttt_valid", "node_indices", "cum_lps"
+    )):
+        raise ValueError("fixed-N pending buffers are smaller than fixed_n")
     mod = _get_module()
     mod.build_tree_block1_fixed_n_cuda(
         rank_preds, greedy_target, greedy_lps,
@@ -136,6 +165,18 @@ def cuda_build_bfs(
     adaptive_all: int,
     pend_depth: int,
 ):
+    required_capacity = tree_bfs_required_capacity(
+        tree_start,
+        N,
+        K,
+        max_topk,
+    )
+    if _tree_buffer_capacity(tree_buf) < required_capacity:
+        raise ValueError(
+            "CUDA tree buffer is too small for worst-case BFS output: "
+            f"capacity={_tree_buffer_capacity(tree_buf)}, "
+            f"required={required_capacity}"
+        )
     mod = _get_module()
     mod.build_tree_bfs_cuda(
         all_rank_preds, all_greedy_target, all_greedy_lps,

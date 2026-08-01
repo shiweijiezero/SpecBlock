@@ -8,7 +8,11 @@ from utils.prompt import detect_model_family, prepare_conversation, get_system_p
 
 
 class BaseAlgorithm(ABC):
-    """Base class for all speculative decoding algorithms."""
+    """Base class for speculative decoding algorithms."""
+
+    # Subclasses must set this only when one generate(samples) call executes the
+    # model over the request batch, rather than looping over requests in Python.
+    supports_true_batch = False
 
     def __init__(
         self,
@@ -23,6 +27,7 @@ class BaseAlgorithm(ABC):
         self.kwargs = kwargs
         self.model_family = detect_model_family(model_path)
         self.tokenizer = None
+        self.last_batch_metrics = None
 
     def prepare_conversation(self, conversation: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Add system prompt if not present."""
@@ -168,6 +173,22 @@ class BaseAlgorithm(ABC):
         for sample in samples:
             result = self._generate_sample(sample, max_new_tokens, temperature, **kwargs)
             results.append(result)
+
+        # The base implementation is intentionally serial.  Expose an honest
+        # aggregate so the benchmark runner can share one accounting path for
+        # batch-aware and serial algorithms without mistaking metadata for a
+        # real engine batch.
+        metric_rows = [result.get("metrics", {}) for result in results]
+        self.last_batch_metrics = {
+            "wall_time": sum(row.get("wall_time", 0.0) for row in metric_rows),
+            "prefill_time": sum(row.get("prefill_time", 0.0) for row in metric_rows),
+            "draft_time": sum(row.get("draft_time", 0.0) for row in metric_rows),
+            "target_time": sum(row.get("target_time", 0.0) for row in metric_rows),
+            "verify_time": sum(row.get("verify_time", 0.0) for row in metric_rows),
+            "iterations": sum(row.get("iterations", 0) for row in metric_rows),
+            "active_sizes": [1] * sum(row.get("iterations", 0) for row in metric_rows),
+            "engine_batch_size": 1,
+        }
         return results
 
     def generate_streaming(

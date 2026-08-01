@@ -519,6 +519,42 @@ def _bfs_scatter_kernel(
 #   Python wrappers
 # =============================================================================
 
+def triton_launch_block1(
+    rank_preds: torch.Tensor,          # [K] i64
+    greedy_target: torch.Tensor,       # [K] i64
+    greedy_lps: torch.Tensor,          # [K] f32
+    all_top_target: torch.Tensor,      # [K, MAX_TOPK] i64
+    all_top_lps: torch.Tensor,         # [K, MAX_TOPK] f32
+    rank_slot_topk_table: torch.Tensor,  # [RANK_CLASSES] i64
+    tree_buf: dict,
+    pend_buf: dict,
+    sizes_buf: torch.Tensor,           # [4] i64 scratch
+    beam_width: int,
+    K: int,
+    max_topk: int,
+    rank_classes: int,
+    give_up_class: int,
+    adaptive_slot0: int,
+    adaptive_all: int,
+):
+    """Launch block-1 without synchronizing size metadata to the CPU."""
+    _block1_mega_kernel[(1,)](
+        rank_preds, greedy_target, greedy_lps,
+        all_top_target, all_top_lps,
+        rank_slot_topk_table,
+        tree_buf['tokens'], tree_buf['parents'], tree_buf['lps'],
+        tree_buf['ranks'], tree_buf['blocks'], tree_buf['slots'],
+        pend_buf['hidden_slots'], pend_buf['input_ids'],
+        pend_buf['ttt_valid'], pend_buf['node_indices'], pend_buf['cum_lps'],
+        sizes_buf,
+        beam_width,
+        K=K, MAX_TOPK=max_topk, RANK_CLASSES=rank_classes,
+        GIVE_UP_CLASS=give_up_class,
+        ADAPTIVE_SLOT0_MODE=adaptive_slot0,
+        ADAPTIVE_ALL_MODE=adaptive_all,
+    )
+
+
 def triton_build_block1(
     rank_preds: torch.Tensor,          # [K] i64
     greedy_target: torch.Tensor,       # [K] i64
@@ -538,23 +574,74 @@ def triton_build_block1(
     adaptive_all: int,
 ):
     """Launch block-1 mega-kernel. Returns (n_nodes_b1, n_active, total_alts1, N_pend) ints."""
-    _block1_mega_kernel[(1,)](
-        rank_preds, greedy_target, greedy_lps,
-        all_top_target, all_top_lps,
+    triton_launch_block1(
+        rank_preds,
+        greedy_target,
+        greedy_lps,
+        all_top_target,
+        all_top_lps,
         rank_slot_topk_table,
-        tree_buf['tokens'], tree_buf['parents'], tree_buf['lps'],
-        tree_buf['ranks'], tree_buf['blocks'], tree_buf['slots'],
-        pend_buf['hidden_slots'], pend_buf['input_ids'],
-        pend_buf['ttt_valid'], pend_buf['node_indices'], pend_buf['cum_lps'],
+        tree_buf,
+        pend_buf,
         sizes_buf,
         beam_width,
-        K=K, MAX_TOPK=max_topk, RANK_CLASSES=rank_classes,
-        GIVE_UP_CLASS=give_up_class,
-        ADAPTIVE_SLOT0_MODE=adaptive_slot0,
-        ADAPTIVE_ALL_MODE=adaptive_all,
+        K,
+        max_topk,
+        rank_classes,
+        give_up_class,
+        adaptive_slot0,
+        adaptive_all,
     )
     sizes_cpu = sizes_buf.cpu().tolist()  # 1 sync; 4 ints
     return sizes_cpu[0], sizes_cpu[1], sizes_cpu[2], sizes_cpu[3]
+
+
+def triton_launch_bfs(
+    all_rank_preds: torch.Tensor,      # [N, K]
+    all_greedy_target: torch.Tensor,   # [N, K]
+    all_greedy_lps: torch.Tensor,      # [N, K]
+    top_target_all: torch.Tensor,      # [N, K, MAX_TOPK]
+    top_lps_all: torch.Tensor,         # [N, K, MAX_TOPK]
+    pend_cum_lps: torch.Tensor,        # [N] f32
+    pend_node_indices: torch.Tensor,   # [N] i64
+    rank_slot_topk_table: torch.Tensor,
+    tree_buf: dict,
+    sizes_buf: torch.Tensor,           # [1] i64 scratch
+    cum_alt_buf: torch.Tensor,         # [BLOCK_N] i64 scratch for leaf offsets
+    tree_start: int,
+    N: int,
+    K: int,
+    max_topk: int,
+    rank_classes: int,
+    give_up_class: int,
+    adaptive_all: int,
+    pend_depth: int,
+    block_n: int = 32,
+    j_pad: int = 16,
+):
+    """Launch BFS sizing and scatter without synchronizing size metadata."""
+    _bfs_sizing_kernel[(1,)](
+        all_rank_preds, all_greedy_lps, rank_slot_topk_table,
+        cum_alt_buf, sizes_buf,
+        N,
+        K=K, MAX_TOPK=max_topk, RANK_CLASSES=rank_classes,
+        ADAPTIVE_ALL_MODE=adaptive_all,
+        BLOCK_N=block_n,
+    )
+    _bfs_scatter_kernel[(N,)](
+        all_rank_preds, all_greedy_target, all_greedy_lps,
+        top_target_all, top_lps_all,
+        pend_cum_lps, pend_node_indices,
+        rank_slot_topk_table, cum_alt_buf,
+        tree_buf['tokens'], tree_buf['parents'], tree_buf['lps'],
+        tree_buf['ranks'], tree_buf['blocks'], tree_buf['slots'],
+        N, tree_start,
+        K=K, MAX_TOPK=max_topk, RANK_CLASSES=rank_classes,
+        GIVE_UP_CLASS=give_up_class,
+        ADAPTIVE_ALL_MODE=adaptive_all,
+        PEND_DEPTH=pend_depth,
+        J_PAD=j_pad,
+    )
 
 
 def triton_build_bfs(
@@ -587,26 +674,27 @@ def triton_build_bfs(
     in parallel (one SM each on A100), reading cum_alt_buf for the leaf's
     global offset and writing greedy chain + alternatives for that leaf.
     """
-    _bfs_sizing_kernel[(1,)](
-        all_rank_preds, all_greedy_lps, rank_slot_topk_table,
-        cum_alt_buf, sizes_buf,
+    triton_launch_bfs(
+        all_rank_preds,
+        all_greedy_target,
+        all_greedy_lps,
+        top_target_all,
+        top_lps_all,
+        pend_cum_lps,
+        pend_node_indices,
+        rank_slot_topk_table,
+        tree_buf,
+        sizes_buf,
+        cum_alt_buf,
+        tree_start,
         N,
-        K=K, MAX_TOPK=max_topk, RANK_CLASSES=rank_classes,
-        ADAPTIVE_ALL_MODE=adaptive_all,
-        BLOCK_N=block_n,
-    )
-    _bfs_scatter_kernel[(N,)](
-        all_rank_preds, all_greedy_target, all_greedy_lps,
-        top_target_all, top_lps_all,
-        pend_cum_lps, pend_node_indices,
-        rank_slot_topk_table, cum_alt_buf,
-        tree_buf['tokens'], tree_buf['parents'], tree_buf['lps'],
-        tree_buf['ranks'], tree_buf['blocks'], tree_buf['slots'],
-        N, tree_start,
-        K=K, MAX_TOPK=max_topk, RANK_CLASSES=rank_classes,
-        GIVE_UP_CLASS=give_up_class,
-        ADAPTIVE_ALL_MODE=adaptive_all,
-        PEND_DEPTH=pend_depth,
-        J_PAD=j_pad,
+        K,
+        max_topk,
+        rank_classes,
+        give_up_class,
+        adaptive_all,
+        pend_depth,
+        block_n,
+        j_pad,
     )
     return int(sizes_buf.cpu().item())

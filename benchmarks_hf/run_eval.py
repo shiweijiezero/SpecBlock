@@ -3,7 +3,9 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
+import socket
 import sys
 import time
 
@@ -78,7 +80,11 @@ def main():
         type=str,
         nargs="+",
         default=None,
-        help='Config list in format "batch_size,steps,topk,draft_tokens" (e.g., "1,7,10,60" "1,2,10,90"). Defaults: specblock → "1,2,10,90", eagle3 → "1,7,4,20".',
+        help=(
+            'Config format: "batch_size,steps,topk,draft_tokens'
+            '[,tree_k[,tree_k_bfs[,diverse_beam[,strict_linear]]]]". '
+            'Use strict_linear=1 only for the explicit no-branching SpecBlock ablation.'
+        ),
     )
 
     # Output arguments
@@ -87,6 +93,13 @@ def main():
         type=str,
         required=True,
         help="Output file path (JSONL format)",
+    )
+    parser.add_argument("--run-id", default=os.environ.get("HF_EVAL_RUN_ID"))
+    parser.add_argument("--run-root", default=os.environ.get("HF_EVAL_RUN_ROOT"))
+    parser.add_argument(
+        "--provenance-json",
+        default=os.environ.get("HF_EVAL_PROVENANCE_JSON"),
+        help="Immutable JSON provenance written by the formal matrix launcher.",
     )
 
     parser.add_argument(
@@ -104,11 +117,11 @@ def main():
         if args.draft_model_path is None:
             parser.error(f"--draft-model-path is required for {args.algorithm}")
 
-    # Auto-default config_list per algorithm if omitted.
+    # Auto-default config_list per algorithm if omitted (Day 22 unified Pareto).
     if args.config_list is None:
         _ALGO_DEFAULT_CFG = {
             "specblock": "1,2,10,90",
-            "eagle3":    "1,7,4,20",
+            "eagle3": "1,7,10,60",
         }
         if args.algorithm in _ALGO_DEFAULT_CFG:
             args.config_list = [_ALGO_DEFAULT_CFG[args.algorithm]]
@@ -134,16 +147,29 @@ def main():
     else:
         temperatures = [0.0]  # Default temperature
 
-    # Parse config_list: "batch_size,steps,topk,draft_tokens[,tree_k[,tree_k_bfs[,diverse_beam]]]"
+    # Parse config_list:
+    # "batch_size,steps,topk,draft_tokens[,tree_k[,tree_k_bfs[,diverse_beam[,strict_linear]]]]"
     configs = []
     for config_str in args.config_list:
         parts = config_str.split(',')
-        if len(parts) < 4 or len(parts) > 7:
-            parser.error(f"Invalid config format: {config_str}. Expected 'batch_size,steps,topk,draft_tokens[,tree_k[,tree_k_bfs[,diverse_beam]]]'")
+        if len(parts) < 4 or len(parts) > 8:
+            parser.error(
+                f"Invalid config format: {config_str}. Expected "
+                "'batch_size,steps,topk,draft_tokens"
+                "[,tree_k[,tree_k_bfs[,diverse_beam[,strict_linear]]]]'"
+            )
         batch_size, steps, topk, draft_tokens = map(int, parts[:4])
         tree_k = int(parts[4]) if len(parts) >= 5 else 0
         tree_k_bfs = int(parts[5]) if len(parts) >= 6 else 0
         diverse_beam = int(parts[6]) if len(parts) >= 7 else 0
+        strict_linear = int(parts[7]) if len(parts) >= 8 else 0
+        if strict_linear not in (0, 1):
+            parser.error(f"strict_linear must be 0 or 1, got {strict_linear}")
+        if strict_linear:
+            if args.algorithm != "specblock":
+                parser.error("strict_linear=1 is supported only for specblock")
+            if topk != 1:
+                parser.error("strict_linear=1 requires topk=1 in the recorded config")
         configs.append({
             "batch_size": batch_size,
             "steps": steps,
@@ -152,13 +178,37 @@ def main():
             "tree_k": tree_k,
             "tree_k_bfs": tree_k_bfs,
             "diverse_beam": diverse_beam,
+            "strict_linear": strict_linear,
         })
 
-    # Prepare output
+    # Formal matrix artifacts are write-once.  Ad-hoc callers retain the historic
+    # append-only behavior, but a declared run root never silently mixes runs.
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_output_path = output_path.with_name(
+        f"{output_path.stem}.samples{output_path.suffix}"
+    )
+    run_root = Path(args.run_root).resolve() if args.run_root else None
+    if run_root is not None:
+        try:
+            output_path.resolve().relative_to(run_root)
+        except ValueError as exc:
+            raise ValueError("formal --output must be inside --run-root") from exc
+        if output_path.exists() or sample_output_path.exists():
+            raise FileExistsError(f"formal output already exists: {output_path}")
+    provenance = {}
+    if args.provenance_json:
+        provenance_path = Path(args.provenance_json)
+        with provenance_path.open(encoding="utf-8") as handle:
+            provenance = json.load(handle)
+        if not isinstance(provenance, dict):
+            raise ValueError("--provenance-json must contain a JSON object")
+    node = os.environ.get("HF_EVAL_NODE", socket.gethostname().split(".")[0])
+    visible_gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 
     all_results = []
+    formal_summary_lines = []
+    formal_sample_lines = []
 
     # Run evaluation for each config, dataset, and temperature combination
     for config_idx, config in enumerate(configs):
@@ -169,10 +219,23 @@ def main():
         # Initialize algorithm with this config
         print(f"Initializing algorithm: {args.algorithm}")
         algorithm_kwargs = {}
-        if args.algorithm == "eagle3":
+        if args.algorithm in ("diffspec", "diffspec_shift"):
+            algorithm_kwargs["diff_steps"] = config["steps"]
+            algorithm_kwargs["draft_tokens"] = config["draft_tokens"]
+        elif args.algorithm == "diffspec_linear":
+            algorithm_kwargs["diff_steps"] = config["steps"]
+            algorithm_kwargs["draft_tokens"] = config["draft_tokens"]
+        elif args.algorithm == "ngram":
+            algorithm_kwargs["ngram_size"] = config["steps"]  # reuse steps as ngram_size
+            algorithm_kwargs["draft_tokens"] = config["draft_tokens"]
+        elif args.algorithm in ["medusa", "eagle3"]:
             algorithm_kwargs["depth"] = config["steps"]
             algorithm_kwargs["topk"] = config["topk"]
             algorithm_kwargs["draft_tokens"] = config["draft_tokens"]
+        elif args.algorithm == "traditional_spec":
+            algorithm_kwargs["depth"] = config["steps"]
+            algorithm_kwargs["topk"] = config["topk"]
+            algorithm_kwargs["total_tokens"] = config["draft_tokens"]
         elif args.algorithm == "specblock":
             # steps=0 means use config.json default
             if config["steps"] > 0:
@@ -186,6 +249,12 @@ def main():
                 algorithm_kwargs["tree_K_bfs"] = config["tree_k_bfs"]
             if config.get("diverse_beam", 0) > 0:
                 algorithm_kwargs["diverse_beam"] = True
+            if config.get("strict_linear", 0) > 0:
+                algorithm_kwargs["strict_linear"] = True
+        elif args.algorithm == "hf_assisted":
+            # For HF assisted: steps = num_assistant_tokens
+            algorithm_kwargs["num_assistant_tokens"] = config["steps"]
+            # topk not used, draft_tokens not used directly
 
         if args.draft_quantize:
             algorithm_kwargs["draft_quantize"] = args.draft_quantize
@@ -198,8 +267,22 @@ def main():
             **algorithm_kwargs
         )
 
+        batch_size = config["batch_size"]
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if batch_size > 1 and not getattr(algorithm, "supports_true_batch", False):
+            raise RuntimeError(
+                f"{args.algorithm} does not implement request-level batching; "
+                f"refusing to report serial execution as batch_size={batch_size}"
+            )
+
         for dataset_idx, dataset_name in enumerate(datasets):
             num_samples = num_samples_per_dataset[dataset_idx]
+
+            # Per-bench reset for algorithms that support it (fast_adapt).
+            # Base algorithms ignore this hook.
+            if hasattr(algorithm, 'reset_for_bench_run'):
+                algorithm.reset_for_bench_run()
 
             # Load dataset
             print(f"\n{'='*60}")
@@ -222,6 +305,26 @@ def main():
                 print(f"  Temperature: {temp}")
                 print(f"{'='*60}")
 
+                # Warm one complete engine batch, then measure every requested sample.
+                # Re-running the warmup rows keeps --benchmark-list dataset:N honest
+                # even when N is exactly one engine batch (for example B=16, N=16).
+                warmup_samples = data[:batch_size]
+                if warmup_samples:
+                    warmup_responses = algorithm.generate(
+                        warmup_samples,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=temp,
+                    )
+                    if len(warmup_responses) != len(warmup_samples):
+                        raise RuntimeError(
+                            f"{args.algorithm}.generate returned "
+                            f"{len(warmup_responses)} warmup responses for "
+                            f"{len(warmup_samples)} requests"
+                        )
+                reset_after_warmup = getattr(algorithm, "reset_after_warmup", None)
+                if reset_after_warmup is not None:
+                    reset_after_warmup()
+
                 # Track metrics for this dataset
                 start_time = time.time()
                 total_tokens = 0
@@ -240,77 +343,138 @@ def main():
                 # Rank stats aggregation (specblock only)
                 all_rank_stats = []
                 all_block_pos_stats = []
+                all_active_sizes = []
+                total_block2_packed_leaves = 0
+                total_block2_padded_capacity = 0
+                total_target_prefill_lm_head_rows = 0
+                total_target_prefill_lm_head_capacity = 0
+                total_target_verify_lm_head_rows = 0
+                total_target_verify_lm_head_capacity = 0
+                measured_samples = 0
 
                 results = []
-                warmup_done = False  # Skip first sample: triggers JIT compilation (torch.compile + Triton)
-                pbar = tqdm(data, desc=f"{dataset_name} T={temp}", unit="sample")
-                for sample in pbar:
-                    # Generate response (pass full sample - base class handles turns/conversation)
-                    response = algorithm.generate(
-                        [sample],
+                pbar = tqdm(total=len(data), desc=f"{dataset_name} T={temp}", unit="sample")
+                for batch_start in range(0, len(data), batch_size):
+                    batch_samples = data[batch_start:batch_start + batch_size]
+                    responses = algorithm.generate(
+                        batch_samples,
                         max_new_tokens=args.max_new_tokens,
                         temperature=temp,
-                    )[0]
+                    )
+                    if len(responses) != len(batch_samples):
+                        raise RuntimeError(
+                            f"{args.algorithm}.generate returned {len(responses)} responses "
+                            f"for {len(batch_samples)} requests"
+                        )
+                    pbar.update(len(batch_samples))
 
-                    if not warmup_done:
-                        warmup_done = True
-                        continue  # Discard first sample: JIT warmup skews timing
+                    batch_metrics = getattr(algorithm, "last_batch_metrics", None) or {}
+                    total_wall_time += batch_metrics.get("wall_time", 0.0)
+                    total_prefill_time += batch_metrics.get("prefill_time", 0.0)
+                    total_draft_time += batch_metrics.get("draft_time", 0.0)
+                    total_target_time += batch_metrics.get("target_time", 0.0)
+                    total_verify_time += batch_metrics.get("verify_time", 0.0)
+                    total_iterations += batch_metrics.get("iterations", 0)
+                    all_active_sizes.extend(batch_metrics.get("active_sizes", []))
+                    total_block2_packed_leaves += batch_metrics.get(
+                        "block2_packed_leaves", 0
+                    )
+                    total_block2_padded_capacity += batch_metrics.get(
+                        "block2_padded_capacity", 0
+                    )
+                    total_target_prefill_lm_head_rows += batch_metrics.get(
+                        "target_prefill_lm_head_rows", 0
+                    )
+                    total_target_prefill_lm_head_capacity += batch_metrics.get(
+                        "target_prefill_lm_head_capacity", 0
+                    )
+                    total_target_verify_lm_head_rows += batch_metrics.get(
+                        "target_verify_lm_head_rows", 0
+                    )
+                    total_target_verify_lm_head_capacity += batch_metrics.get(
+                        "target_verify_lm_head_capacity", 0
+                    )
+                    measured_samples += len(batch_samples)
+                    batch_forward_times = batch_metrics.get("draft_forward_times", {})
+                    for depth, value in batch_forward_times.items():
+                        total_draft_forward_times[depth] = (
+                            total_draft_forward_times.get(depth, 0.0) + value
+                        )
 
-                    total_tokens += response["metrics"]["total_tokens"]
-                    if "accept_length" in response["metrics"]:
-                        accept_lengths.append(response["metrics"]["accept_length"])
-                    if "accept_rate" in response["metrics"]:
-                        accept_rates.append(response["metrics"]["accept_rate"])
-                    if "accept_lengths_raw" in response["metrics"]:
-                        all_accept_lengths_raw.extend(response["metrics"]["accept_lengths_raw"])
-                    # Collect time breakdown
-                    if "prefill_time" in response["metrics"]:
-                        total_prefill_time += response["metrics"]["prefill_time"]
-                    if "draft_time" in response["metrics"]:
-                        total_draft_time += response["metrics"]["draft_time"]
-                    if "target_time" in response["metrics"]:
-                        total_target_time += response["metrics"]["target_time"]
-                    if "verify_time" in response["metrics"]:
-                        total_verify_time += response["metrics"]["verify_time"]
-                    if "wall_time" in response["metrics"]:
-                        total_wall_time += response["metrics"]["wall_time"]
-                    if "iterations" in response["metrics"]:
-                        total_iterations += response["metrics"]["iterations"]
-                    if "draft_forward_times" in response["metrics"] and response["metrics"]["draft_forward_times"]:
-                        for depth, t in response["metrics"]["draft_forward_times"].items():
-                            total_draft_forward_times[depth] = total_draft_forward_times.get(depth, 0.0) + t
-                    if "rank_stats" in response["metrics"] and response["metrics"]["rank_stats"]:
-                        all_rank_stats.append(response["metrics"]["rank_stats"])
-                    if "block_pos_stats" in response["metrics"] and response["metrics"]["block_pos_stats"]:
-                        all_block_pos_stats.append(response["metrics"]["block_pos_stats"])
+                    for sample, response in zip(batch_samples, responses):
+                        metrics = response["metrics"]
+                        total_tokens += metrics["total_tokens"]
+                        if "accept_length" in metrics:
+                            accept_lengths.append(metrics["accept_length"])
+                        if "accept_rate" in metrics:
+                            accept_rates.append(metrics["accept_rate"])
+                        if "accept_lengths_raw" in metrics:
+                            all_accept_lengths_raw.extend(metrics["accept_lengths_raw"])
+                        if not batch_forward_times and metrics.get("draft_forward_times"):
+                            for depth, value in metrics["draft_forward_times"].items():
+                                total_draft_forward_times[depth] = (
+                                    total_draft_forward_times.get(depth, 0.0) + value
+                                )
+                        if metrics.get("rank_stats"):
+                            all_rank_stats.append(metrics["rank_stats"])
+                        if metrics.get("block_pos_stats"):
+                            all_block_pos_stats.append(metrics["block_pos_stats"])
 
-                    # Update progress bar with real-time metrics
+                        results.append({
+                            "id": sample["id"],
+                            "category": sample.get("category", "unknown"),
+                            "schema_version": "hf-eval-artifact-v2",
+                            "run_id": args.run_id,
+                            "run_root": str(run_root) if run_root else None,
+                            "algorithm": args.algorithm,
+                            "config": config,
+                            "config_key": f"{config['batch_size']},{config['steps']},{config['topk']},{config['draft_tokens']}",
+                            "batch_size": config["batch_size"],
+                            "dataset": dataset_name,
+                            "temperature": temp,
+                            "requested_samples": len(data),
+                            "max_new_tokens": args.max_new_tokens,
+                            "node": node,
+                            "visible_gpu": visible_gpu,
+                            "provenance": provenance,
+                            "conversation": sample.get("conversation"),
+                            "turns": sample.get("turns"),
+                            "reference": sample.get("reference"),
+                            "evaluation": sample.get("evaluation"),
+                            "output": response["output"],
+                            "total_tokens": metrics["total_tokens"],
+                        })
+
                     elapsed = total_wall_time if total_wall_time > 0 else (time.time() - start_time)
                     cur_throughput = total_tokens / elapsed if elapsed > 0 else 0
-                    cur_acc_len = sum(accept_lengths) / len(accept_lengths) if accept_lengths else 0
+                    # Raw values are draft tokens accepted in each speculative
+                    # round; reported acceptance length includes the verified token.
+                    cur_acc_len = (
+                        sum(all_accept_lengths_raw) / len(all_accept_lengths_raw) + 1
+                        if all_accept_lengths_raw else 0
+                    )
                     pbar.set_postfix({
                         "tok/s": f"{cur_throughput:.1f}",
                         "acc_len": f"{cur_acc_len:.2f}",
                         "tokens": total_tokens,
                     })
-
-                    # Save individual result
-                    result = {
-                        "id": sample["id"],
-                        "category": sample.get("category", "unknown"),
-                        "algorithm": args.algorithm,
-                        "config": config,
-                        "dataset": dataset_name,
-                        "temperature": temp,
-                        "output": response["output"],
-                        "metrics": response["metrics"],
-                    }
-                    results.append(result)
+                pbar.close()
 
                 duration = total_wall_time if total_wall_time > 0 else (time.time() - start_time)
                 throughput = total_tokens / duration if duration > 0 else 0
-                avg_acc_length = sum(accept_lengths) / len(accept_lengths) if accept_lengths else None
+                # Do not average request-level means: requests can have different
+                # numbers of speculative rounds. Pool every raw round instead.
+                avg_acc_length = (
+                    sum(all_accept_lengths_raw) / len(all_accept_lengths_raw) + 1
+                    if all_accept_lengths_raw else None
+                )
                 avg_acc_rate = sum(accept_rates) / len(accept_rates) if accept_rates else None
+                requested_samples = len(data)
+                if measured_samples != requested_samples or len(results) != requested_samples:
+                    raise RuntimeError(
+                        f"incomplete partition {dataset_name} T={temp}: requested="
+                        f"{requested_samples}, measured={measured_samples}, results={len(results)}"
+                    )
 
                 # Calculate time breakdown percentages
                 total_stage_time = total_draft_time + total_target_time + total_verify_time
@@ -369,6 +533,16 @@ def main():
 
                 # Create summary record (aligned with bench_model_speedup.py format)
                 summary_record = {
+                    "schema_version": "hf-eval-summary-v2",
+                    "run_id": args.run_id,
+                    "run_root": str(run_root) if run_root else None,
+                    "provenance": provenance,
+                    "node": node,
+                    "visible_gpu": visible_gpu,
+                    "model_path": args.model_path,
+                    "draft_model_path": args.draft_model_path,
+                    "max_new_tokens": args.max_new_tokens,
+                    "sample_artifact": sample_output_path.name,
                     "batch_size": config["batch_size"],
                     "steps": config["steps"],
                     "topk": config["topk"],
@@ -382,6 +556,38 @@ def main():
                     "temperature": temp,
                     "config": f"{config['batch_size']},{config['steps']},{config['topk']},{config['draft_tokens']}",
                     "algorithm": args.algorithm,
+                    "requested_samples": requested_samples,
+                    "measured_samples": measured_samples,
+                    "failed_requests": 0,
+                    "acceptance_rounds": len(all_accept_lengths_raw),
+                    "acceptance_raw_sum": sum(all_accept_lengths_raw),
+                    "true_batch": bool(getattr(algorithm, "supports_true_batch", False)),
+                    "active_batch_sizes": all_active_sizes,
+                    "block2_packed_leaves": total_block2_packed_leaves,
+                    "block2_padded_capacity": total_block2_padded_capacity,
+                    "block2_padding_removed": (
+                        total_block2_padded_capacity - total_block2_packed_leaves
+                    ),
+                    "block2_padding_removed_pct": (
+                        100.0
+                        * (
+                            total_block2_padded_capacity
+                            - total_block2_packed_leaves
+                        )
+                        / total_block2_padded_capacity
+                        if total_block2_padded_capacity > 0
+                        else 0.0
+                    ),
+                    "target_prefill_lm_head_rows": total_target_prefill_lm_head_rows,
+                    "target_prefill_lm_head_capacity": total_target_prefill_lm_head_capacity,
+                    "target_verify_lm_head_rows": total_target_verify_lm_head_rows,
+                    "target_verify_lm_head_capacity": total_target_verify_lm_head_capacity,
+                    "target_lm_head_rows_removed": (
+                        total_target_prefill_lm_head_capacity
+                        + total_target_verify_lm_head_capacity
+                        - total_target_prefill_lm_head_rows
+                        - total_target_verify_lm_head_rows
+                    ),
                     # Time breakdown (seconds and percentages)
                     "prefill_time": float(f"{total_prefill_time:.2f}") if total_prefill_time > 0 else None,
                     "draft_time": float(f"{total_draft_time:.2f}") if total_draft_time > 0 else None,
@@ -444,14 +650,33 @@ def main():
                         bp_parts.append(f"{key}={s['accuracy']*100:.1f}%")
                     print(f"    Block-Pos Accuracy: {' '.join(bp_parts)}", flush=True)
 
-                # Append summary record to output file immediately
-                with open(output_path, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(summary_record, ensure_ascii=False) + '\n')
+                # Formal partitions are buffered and published atomically below;
+                # ad-hoc callers keep the legacy append-only behavior.
+                if run_root is not None:
+                    formal_sample_lines.extend(json.dumps(result, ensure_ascii=False) + "\n" for result in results)
+                    formal_summary_lines.append(json.dumps(summary_record, ensure_ascii=False) + "\n")
+                else:
+                    with open(sample_output_path, 'a', encoding='utf-8') as f:
+                        for result in results:
+                            f.write(json.dumps(result, ensure_ascii=False) + '\n')
+                    with open(output_path, 'a', encoding='utf-8') as f:
+                        f.write(json.dumps(summary_record, ensure_ascii=False) + '\n')
 
                 all_results.extend(results)
 
         # Cleanup algorithm for this config
         algorithm.cleanup()
+
+    if run_root is not None:
+        # Same-directory temp files make rename atomic. Exclusive final paths were
+        # checked before execution, so a retry cannot append into this partition.
+        for final_path, lines in ((sample_output_path, formal_sample_lines), (output_path, formal_summary_lines)):
+            temp_path = final_path.with_name(f".{final_path.name}.{os.getpid()}.tmp")
+            with temp_path.open("x", encoding="utf-8") as handle:
+                handle.writelines(lines)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, final_path)
 
     # Print final summary
     print(f"\n{'='*60}")

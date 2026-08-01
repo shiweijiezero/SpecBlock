@@ -34,11 +34,70 @@ from collections import deque
 from typing import Iterator, List, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 logger = logging.getLogger(__name__)
 
 
 _DEFAULT_GROW_CHUNK = 65536  # 65K slots per grow → ~2 GB on Llama-3.1-8B
+
+
+@triton.jit
+def _set_kv_padded_kernel(
+    k_pool_ptr,
+    v_pool_ptr,
+    indices_ptr,
+    cache_k_ptr,
+    cache_v_ptr,
+    valid_slots_ptr,
+    slots_per_row,
+    stride_pool_slot: tl.constexpr,
+    stride_pool_head: tl.constexpr,
+    stride_pool_dim: tl.constexpr,
+    stride_indices_batch: tl.constexpr,
+    stride_indices_slot: tl.constexpr,
+    stride_cache_batch: tl.constexpr,
+    stride_cache_head: tl.constexpr,
+    stride_cache_slot: tl.constexpr,
+    stride_cache_dim: tl.constexpr,
+    N_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    row = tl.program_id(0)
+    batch_idx = row // slots_per_row
+    slot_idx = row - batch_idx * slots_per_row
+    valid_slots = tl.load(valid_slots_ptr + batch_idx)
+    slot_valid = slot_idx < valid_slots
+    pool_idx = tl.load(
+        indices_ptr
+        + batch_idx * stride_indices_batch
+        + slot_idx * stride_indices_slot,
+        mask=slot_valid,
+        other=0,
+    )
+
+    hd = tl.program_id(1) * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    head_idx = hd // HEAD_DIM
+    dim_idx = hd - head_idx * HEAD_DIM
+    mask = slot_valid & (hd < N_HEADS * HEAD_DIM)
+
+    cache_offset = (
+        batch_idx * stride_cache_batch
+        + head_idx * stride_cache_head
+        + slot_idx * stride_cache_slot
+        + dim_idx * stride_cache_dim
+    )
+    pool_offset = (
+        pool_idx * stride_pool_slot
+        + head_idx * stride_pool_head
+        + dim_idx * stride_pool_dim
+    )
+    cache_k = tl.load(cache_k_ptr + cache_offset, mask=mask, other=0.0)
+    cache_v = tl.load(cache_v_ptr + cache_offset, mask=mask, other=0.0)
+    tl.store(k_pool_ptr + pool_offset, cache_k, mask=mask)
+    tl.store(v_pool_ptr + pool_offset, cache_v, mask=mask)
 
 
 class SpecBlockKVPool:
@@ -103,8 +162,8 @@ class SpecBlockKVPool:
         # while any operation that would replace tensors raises.
         self._in_capture = False
 
-        # Bumped if the buffer is ever recreated (currently never; kept
-        # so cuda graph runners can cache (pool_version, ...) -> graph).
+        # Bumped whenever grow replaces the K/V storage so graph runners
+        # can invalidate every entry captured against the old pointers.
         self.pool_version = 0
 
         # Optional flashinfer paged cross attention helper.  Worker
@@ -154,11 +213,10 @@ class SpecBlockKVPool:
     def capture_mode(self) -> Iterator[None]:
         """Mark a region as cuda-graph capture.
 
-        Inside this ctx, the pool tensors must not be replaced (currently
-        impossible since grow is removed, but kept as a guard for future
-        changes).  alloc / free still mutate the Python free list — this
-        is fine because graphs capture only the underlying tensor data,
-        not the Python-side bookkeeping.
+        Inside this ctx, the pool tensors must not be replaced.  ``alloc``
+        and ``free`` may still mutate the Python free list when no grow is
+        needed; graphs capture only the underlying tensor data, not this
+        bookkeeping.
 
         Nested capture_mode calls are not allowed.
         """
@@ -299,6 +357,70 @@ class SpecBlockKVPool:
         # Index assign.  PyTorch handles int64 index broadcasting.
         self.k_buffer[layer_id, indices] = cache_k
         self.v_buffer[layer_id, indices] = cache_v
+
+    def set_kv_padded(
+        self,
+        layer_id: int,
+        indices: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        valid_slots: torch.Tensor,
+    ) -> None:
+        """Write only each row's valid prefix from padded batched K/V.
+
+        ``indices`` is ``[B, max_slots]`` and ``cache_k/cache_v`` are
+        ``[B, n_heads, max_slots, head_dim]``.  ``valid_slots[b]`` gives the
+        number of live entries in row ``b``.  Padding locations are never
+        loaded or written, which keeps reserved pool slot 0 zero.
+        """
+        if indices.numel() == 0:
+            return
+        if cache_k.shape != cache_v.shape:
+            raise ValueError(
+                f"set_kv_padded: cache_k {tuple(cache_k.shape)} != cache_v "
+                f"{tuple(cache_v.shape)}"
+            )
+        B, n_heads, max_slots, head_dim = cache_k.shape
+        if indices.shape != (B, max_slots):
+            raise ValueError(
+                f"set_kv_padded: indices {tuple(indices.shape)} != "
+                f"({B}, {max_slots})"
+            )
+        if n_heads != self.n_heads or head_dim != self.head_dim:
+            raise ValueError(
+                f"set_kv_padded: cache shape heads/dim=({n_heads}, {head_dim}) "
+                f"!= pool ({self.n_heads}, {self.head_dim})"
+            )
+        if valid_slots.shape != (B,):
+            raise ValueError(
+                f"set_kv_padded: valid_slots {tuple(valid_slots.shape)} != ({B},)"
+            )
+
+        k_pool = self.k_buffer[layer_id]
+        v_pool = self.v_buffer[layer_id]
+        block_hd = 256
+        grid = (B * max_slots, triton.cdiv(n_heads * head_dim, block_hd))
+        _set_kv_padded_kernel[grid](
+            k_pool,
+            v_pool,
+            indices,
+            cache_k,
+            cache_v,
+            valid_slots,
+            max_slots,
+            stride_pool_slot=k_pool.stride(0),
+            stride_pool_head=k_pool.stride(1),
+            stride_pool_dim=k_pool.stride(2),
+            stride_indices_batch=indices.stride(0),
+            stride_indices_slot=indices.stride(1),
+            stride_cache_batch=cache_k.stride(0),
+            stride_cache_head=cache_k.stride(1),
+            stride_cache_slot=cache_k.stride(2),
+            stride_cache_dim=cache_k.stride(3),
+            N_HEADS=n_heads,
+            HEAD_DIM=head_dim,
+            BLOCK_HD=block_hd,
+        )
 
     def get_k(self, layer_id: int) -> torch.Tensor:
         """Return the entire K buffer for ``layer_id`` (no-copy view).

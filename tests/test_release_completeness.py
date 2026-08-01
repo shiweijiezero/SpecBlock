@@ -79,6 +79,30 @@ class TreeBuildReleaseCompletenessTest(unittest.TestCase):
                 self.assertIn(f"mod.{symbol}(", loader)
                 self.assertIn(f'm.def("{symbol}"', source)
 
+    def test_true_batch_runtime_files_are_present(self) -> None:
+        required = (
+            "eagle3_batch.py",
+            "specblock_batch.py",
+            "hf_batch_invariant.py",
+            "target_kv_copy_triton.py",
+        )
+        missing = [name for name in required if not (ALGORITHMS_DIR / name).is_file()]
+        self.assertEqual([], missing, f"missing true-batch runtime files: {missing}")
+
+    def test_sglang_specblock_model_sources_are_present(self) -> None:
+        models_dir = (
+            REPO_ROOT / "sglang-main" / "python" / "sglang" / "srt" / "models"
+        )
+        required = (
+            "registry.py",
+            "_specblock_inference.py",
+            "_specblock_shift_inference.py",
+            "_tree_attention_triton.py",
+            "llama_specblock_shift.py",
+        )
+        missing = [name for name in required if not (models_dir / name).is_file()]
+        self.assertEqual([], missing, f"missing SGLang model sources: {missing}")
+
 
 if __name__ == "__main__":
     unittest.main()
