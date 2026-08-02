@@ -79,19 +79,3 @@ benchmarks_hf/
 ├── modeling/               # eagle3 helper modeling code
 └── utils/                  # metrics, KV-cache helpers, prompt formatting
 ```
-
-## True request batching
-
-The HuggingFace evaluator supports true request-level batching for EAGLE-3 and SpecBlock. Set the first value in `--config-list` to the desired batch size. The target prefill and verification forwards are batched across active requests rather than emulated with serial B=1 calls.
-
-```bash
-python benchmarks_hf/run_eval.py \
-    --algorithm specblock \
-    --model-path meta-llama/Llama-3.1-8B-Instruct \
-    --draft-model-path ./model/Llama-3.1-8B-Instruct/specblock-layer2 \
-    --benchmark-list humaneval:164 \
-    --config-list "8,2,10,90" \
-    --output ./hf_results/specblock_b8.jsonl
-```
-
-The evaluator rejects `batch_size > 1` for algorithms without a true batching implementation. It also records active-batch shrinkage and separates prefill, drafting, target verification, and acceptance overhead.
