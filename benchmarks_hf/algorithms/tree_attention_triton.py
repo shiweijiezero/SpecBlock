@@ -138,8 +138,8 @@ def tree_attention(q, k_full, v_full, cross_count, k_slots, scale):
     assert q.dtype == k_full.dtype == v_full.dtype
     assert D == 128, f"kernel hardcoded for D=128, got {D}"
 
-    # Block sizes — BLOCK_M tuned for small-M decoding
-    BLOCK_M = 16 if M <= 16 else 32
+    # Use the smallest power-of-two query tile, capped for large-tree tiling.
+    BLOCK_M = min(32, triton.next_power_of_2(M))
     BLOCK_N = 64
 
     out = torch.empty_like(q)
@@ -299,7 +299,7 @@ def ragged_tree_attention(
         raise ValueError("ragged draft attention requires CUDA tensors")
     if max_total <= 0 or max_total > cache_k.shape[2]:
         raise ValueError("ragged draft attention width is out of range")
-    block_m = 16 if M <= 16 else 32
+    block_m = min(32, triton.next_power_of_2(M))
     block_n = 64
     out = torch.empty_like(q)
     grid = (triton.cdiv(M, block_m), B, H)
@@ -338,7 +338,7 @@ def _single_pos_attn_fwd_kernel(
     stride_o_b, stride_o_h, stride_o_m, stride_o_d,
     scale: tl.constexpr,
     K_SLOTS: tl.constexpr,         # M = K_SLOTS for single-position path
-    BLOCK_M: tl.constexpr,         # padded to >=16 for tl.dot portability
+    BLOCK_M: tl.constexpr,         # smallest power-of-two query tile
     HAS_TTT: tl.constexpr,
     BLOCK_N: tl.constexpr,
     D: tl.constexpr,
@@ -350,9 +350,8 @@ def _single_pos_attn_fwd_kernel(
       [cross_count, curr_start)    — ttt cache, masked by TTT_mask
       [curr_start, C)              — current K, causal within the K slots
 
-    Each program handles all M queries for one (batch, head). The physical
-    query tile is padded to BLOCK_M because some Triton backends require every
-    non-batch tl.dot dimension to be at least 16.
+    Each program handles all M queries for one (batch, head). BLOCK_M is the
+    smallest power-of-two tile covering the query width.
     """
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -361,7 +360,7 @@ def _single_pos_attn_fwd_kernel(
     m_in_bounds = offs_m < K_SLOTS
     offs_d = tl.arange(0, D)
 
-    # Load Q; padded rows participate in the tile but are not stored.
+    # Load Q; non-power-of-two tail rows are masked.
     q_base = Q_ptr + pid_b * stride_q_b + pid_h * stride_q_h
     q = tl.load(
         q_base + offs_m[:, None] * stride_q_m + offs_d[None, :] * stride_q_d,
@@ -480,7 +479,7 @@ def single_pos_attention(q, k_full, v_full, cross_count, ttt_count, ttt_mask,
         stride_ttt_b = 0
         stride_ttt_c = 0
 
-    BLOCK_M = 16 if M <= 16 else 32
+    BLOCK_M = triton.next_power_of_2(M)
     BLOCK_N = 64
     grid = (B, H)
     _single_pos_attn_fwd_kernel[grid](
@@ -545,7 +544,7 @@ def _three_part_attn_fwd_kernel(
     stride_o_b, stride_o_h, stride_o_m, stride_o_d,
     scale: tl.constexpr,
     K_SLOTS: tl.constexpr,
-    BLOCK_M: tl.constexpr,         # padded to >=16 for tl.dot portability
+    BLOCK_M: tl.constexpr,         # smallest power-of-two query tile
     CROSS_GQA: tl.constexpr,
     HAS_TTT: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -568,7 +567,7 @@ def _three_part_attn_fwd_kernel(
     m_in_bounds = offs_m < K_SLOTS
     offs_d = tl.arange(0, D)
 
-    # Load Q; padded rows participate in the tile but are not stored.
+    # Load Q; non-power-of-two tail rows are masked.
     q_base = Q_ptr + pid_b * stride_q_b + pid_h * stride_q_h
     q = tl.load(
         q_base + offs_m[:, None] * stride_q_m + offs_d[None, :] * stride_q_d,
@@ -766,7 +765,7 @@ def three_part_attention(
         tk_strides = (ttt_k.stride(0), ttt_k.stride(1), ttt_k.stride(2), ttt_k.stride(3))
         tv_strides = (ttt_v.stride(0), ttt_v.stride(1), ttt_v.stride(2), ttt_v.stride(3))
 
-    BLOCK_M = 16 if M <= 16 else 32
+    BLOCK_M = triton.next_power_of_2(M)
     BLOCK_N = 64
     grid = (B, H)
     _three_part_attn_fwd_kernel[grid](
@@ -1001,7 +1000,7 @@ def ragged_three_part_attention(
 
     ttt_mask_bool = ttt_mask if ttt_mask.dtype == torch.bool else ttt_mask.bool()
     out = torch.empty_like(q)
-    block_m = 16 if query_slots <= 16 else 32
+    block_m = triton.next_power_of_2(query_slots)
     block_n = 64
     _ragged_three_part_attn_fwd_kernel[(leaves, heads)](
         q,
@@ -1145,7 +1144,7 @@ def tree_attention_gqa(q, k, v, cross_count, k_slots, scale):
     assert Hq % Hkv == 0, f"Hq ({Hq}) must be divisible by Hkv ({Hkv})"
     group_size = Hq // Hkv
 
-    BLOCK_M = 16 if M <= 16 else 32
+    BLOCK_M = min(32, triton.next_power_of_2(M))
     BLOCK_N = 64
 
     out = torch.empty_like(q)
