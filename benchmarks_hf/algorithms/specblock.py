@@ -8,6 +8,7 @@ import os
 import torch
 
 from ._specblock_base import _SpecBlockAlgorithmBase
+from .runtime_capabilities import RUNTIME_CAPABILITIES
 
 
 class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
@@ -23,7 +24,7 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
     # override via explicit `export VAR=...` before launching.
     _PARETO_DEFAULTS = {
         # Draft kernel / tree build
-        'DRAFT_COMPILE':            '2',         # torch.compile draft (mode='default') → draft 11→7.4ms
+        'DRAFT_COMPILE':            RUNTIME_CAPABILITIES.draft_compile_default,
         'TREE_ATTN_TRITON':         '1',         # triton attn kernel for draft
         'TREE_ATTN_SDPA':           '0',         # 关掉 SDPA (TRITON 赢在 short prompt)
         'TREE_BUILD_TRITON':        '1',         # triton mega tree build
@@ -36,7 +37,7 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         'SLOT_TOPK_MODE':           'slim_r2',   # [2,4,6,4] — slim rank-2 topk
         'STREAM_COMPACT_PROMPT':    '0',         # compact off (acc drops otherwise)
         # Day 21/22 unified controls
-        'SPECBLOCK_INTERNAL_PREWARM':'1',        # 2-shape internal prewarm (default on, +30-45s load)
+        'SPECBLOCK_INTERNAL_PREWARM': RUNTIME_CAPABILITIES.internal_prewarm_default,
         'SPECBLOCK_DYNAMIC_TREE':   '0',         # prompt-length dynamic tree_tokens (default off, -0.8% avg when on)
     }
 

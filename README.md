@@ -98,6 +98,23 @@ python benchmarks_hf/analyze_results.py ./hf_results/specblock_llama.jsonl
 
 Supported `--algorithm` values: `baseline`, `eagle3`, `specblock`. The benchmark list above matches the paper (HumanEval / MATH-500 / Alpaca / NQ / MT-Bench / WMT-23).
 
+#### MetaX C500
+
+The HF evaluator detects MetaX PyTorch builds automatically. Set the platform explicitly when the runtime does not identify itself in `torch.__version__`:
+
+```bash
+export SPECBLOCK_PLATFORM=metax
+export TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0
+```
+
+An ABI-compatible `sgl_kernel.so` built from MetaX `mcoplib` enables fused SiLU, residual RMSNorm, and RoPE:
+
+```bash
+export SPECBLOCK_SGL_KERNEL_LIBRARY=/path/to/sgl_kernel.so
+```
+
+The library is optional; SpecBlock falls back to native PyTorch operators when it is not configured. MetaX defaults to eager draft execution, while an explicit `DRAFT_COMPILE=1` or `DRAFT_COMPILE=2` still overrides that default.
+
 ### Stage 6 — Interactive UI
 
 ```bash

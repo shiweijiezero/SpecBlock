@@ -31,16 +31,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 
-# Optional sgl_kernel fused kernels for faster draft forward.
-# Falls back to native PyTorch when unavailable (e.g., non-CUDA).
-try:
-    from sgl_kernel import rmsnorm as _sgl_rmsnorm
-    from sgl_kernel import silu_and_mul as _sgl_silu_and_mul
-    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace as _sgl_apply_rope
-    from sgl_kernel import fused_add_rmsnorm as _sgl_fused_add_rmsnorm
-    _SGL_KERNEL_AVAILABLE = True
-except ImportError:
-    _SGL_KERNEL_AVAILABLE = False
+from .sgl_kernel_compat import load_sgl_kernel_ops
+
+
+_SGL_KERNEL_OPS = load_sgl_kernel_ops()
+_SGL_KERNEL_AVAILABLE = _SGL_KERNEL_OPS is not None
+if _SGL_KERNEL_OPS is not None:
+    _sgl_rmsnorm = _SGL_KERNEL_OPS.rmsnorm
+    _sgl_silu_and_mul = _SGL_KERNEL_OPS.silu_and_mul
+    _sgl_apply_rope = _SGL_KERNEL_OPS.apply_rope
+    _sgl_fused_add_rmsnorm = _SGL_KERNEL_OPS.fused_add_rmsnorm
+else:
+    _sgl_rmsnorm = None
+    _sgl_silu_and_mul = None
     _sgl_apply_rope = None
     _sgl_fused_add_rmsnorm = None
 

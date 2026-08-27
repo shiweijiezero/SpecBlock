@@ -27,8 +27,17 @@ import torch
 import triton
 import triton.language as tl
 
+from .runtime_capabilities import RUNTIME_CAPABILITIES
+
 _DUMMY_MASK = None
-_ATTENTION_BLOCK_N = 32 if "metax" in torch.__version__.lower() else 64
+
+
+def _query_block_m(width: int, *, cap: int | None = None) -> int:
+    block_m = max(
+        RUNTIME_CAPABILITIES.minimum_triton_query_tile,
+        triton.next_power_of_2(width),
+    )
+    return min(cap, block_m) if cap is not None else block_m
 
 
 @triton.jit
@@ -140,8 +149,8 @@ def tree_attention(q, k_full, v_full, cross_count, k_slots, scale):
     assert D == 128, f"kernel hardcoded for D=128, got {D}"
 
     # Use the smallest power-of-two query tile, capped for large-tree tiling.
-    BLOCK_M = min(32, triton.next_power_of_2(M))
-    BLOCK_N = _ATTENTION_BLOCK_N
+    BLOCK_M = _query_block_m(M, cap=32)
+    BLOCK_N = RUNTIME_CAPABILITIES.attention_block_n
 
     out = torch.empty_like(q)
 
@@ -300,8 +309,8 @@ def ragged_tree_attention(
         raise ValueError("ragged draft attention requires CUDA tensors")
     if max_total <= 0 or max_total > cache_k.shape[2]:
         raise ValueError("ragged draft attention width is out of range")
-    block_m = min(32, triton.next_power_of_2(M))
-    block_n = _ATTENTION_BLOCK_N
+    block_m = _query_block_m(M, cap=32)
+    block_n = RUNTIME_CAPABILITIES.attention_block_n
     out = torch.empty_like(q)
     grid = (triton.cdiv(M, block_m), B, H)
     _ragged_tree_attn_fwd_kernel[grid](
@@ -480,8 +489,8 @@ def single_pos_attention(q, k_full, v_full, cross_count, ttt_count, ttt_mask,
         stride_ttt_b = 0
         stride_ttt_c = 0
 
-    BLOCK_M = triton.next_power_of_2(M)
-    BLOCK_N = _ATTENTION_BLOCK_N
+    BLOCK_M = _query_block_m(M)
+    BLOCK_N = RUNTIME_CAPABILITIES.attention_block_n
     grid = (B, H)
     _single_pos_attn_fwd_kernel[grid](
         q, k_full, v_full, ttt_mask_bool, out,
@@ -766,8 +775,9 @@ def three_part_attention(
         tk_strides = (ttt_k.stride(0), ttt_k.stride(1), ttt_k.stride(2), ttt_k.stride(3))
         tv_strides = (ttt_v.stride(0), ttt_v.stride(1), ttt_v.stride(2), ttt_v.stride(3))
 
-    BLOCK_M = triton.next_power_of_2(M)
-    BLOCK_N = _ATTENTION_BLOCK_N
+    BLOCK_M = _query_block_m(M)
+    BLOCK_N = RUNTIME_CAPABILITIES.three_part_attention_block_n
+    launch_kwargs = RUNTIME_CAPABILITIES.three_part_attention_launch_kwargs()
     grid = (B, H)
     _three_part_attn_fwd_kernel[grid](
         q,
@@ -792,6 +802,7 @@ def three_part_attention(
         HAS_TTT=has_ttt,
         BLOCK_N=BLOCK_N,
         D=D,
+        **launch_kwargs,
     )
     return out
 
@@ -1001,8 +1012,8 @@ def ragged_three_part_attention(
 
     ttt_mask_bool = ttt_mask if ttt_mask.dtype == torch.bool else ttt_mask.bool()
     out = torch.empty_like(q)
-    block_m = triton.next_power_of_2(query_slots)
-    block_n = _ATTENTION_BLOCK_N
+    block_m = _query_block_m(query_slots)
+    block_n = RUNTIME_CAPABILITIES.attention_block_n
     _ragged_three_part_attn_fwd_kernel[(leaves, heads)](
         q,
         cross_k, cross_v,
@@ -1145,8 +1156,8 @@ def tree_attention_gqa(q, k, v, cross_count, k_slots, scale):
     assert Hq % Hkv == 0, f"Hq ({Hq}) must be divisible by Hkv ({Hkv})"
     group_size = Hq // Hkv
 
-    BLOCK_M = min(32, triton.next_power_of_2(M))
-    BLOCK_N = _ATTENTION_BLOCK_N
+    BLOCK_M = _query_block_m(M, cap=32)
+    BLOCK_N = RUNTIME_CAPABILITIES.attention_block_n
 
     out = torch.empty_like(q)
 

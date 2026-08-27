@@ -16,7 +16,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F
 from transformers.cache_utils import Cache, CacheLayerMixin
+
+from .runtime_capabilities import RUNTIME_CAPABILITIES
 
 
 TreeResult = Tuple[
@@ -697,6 +700,53 @@ def _run_ragged_draft_forward(
     return outputs
 
 
+def _project_initial_ragged_condition(
+    algorithm,
+    hidden_sources: Sequence[torch.Tensor],
+    source_rows: torch.Tensor,
+    source_lengths: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    max_positions: int,
+) -> torch.Tensor:
+    active_count = starts.numel()
+    weight = algorithm.draft_model.input_layer.condition_proj.weight
+    if not RUNTIME_CAPABILITIES.needs_ragged_condition_fallback:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+            matmul_persistent_concat3_ragged,
+        )
+
+        return matmul_persistent_concat3_ragged(
+            hidden_sources[0],
+            hidden_sources[1],
+            hidden_sources[2],
+            weight,
+            source_rows[:active_count],
+            source_lengths[:active_count],
+            starts,
+            lengths,
+            max_positions,
+        )
+
+    # The MetaX persistent kernel returns incorrect values for nonzero chunk
+    # offsets. This explicit gather only runs during initial prompt prefill.
+    positions = starts[:, None] + torch.arange(
+        max_positions,
+        device=starts.device,
+        dtype=torch.long,
+    )[None, :]
+    positions = torch.minimum(
+        positions,
+        source_lengths[:active_count, None] - 1,
+    )
+    rows = source_rows[:active_count, None].expand_as(positions)
+    condition_input = torch.cat(
+        [source[rows, positions] for source in hidden_sources],
+        dim=-1,
+    )
+    return F.linear(condition_input, weight)
+
+
 def _run_initial_ragged_draft_forward(
     algorithm,
     draft_cache: _DraftBatchCache,
@@ -747,16 +797,11 @@ def _run_initial_ragged_draft_forward(
     lengths = torch.tensor(
         valid_lengths[:active_count], dtype=torch.long, device=device
     )
-    from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
-        matmul_persistent_concat3_ragged,
-    )
-    condition = matmul_persistent_concat3_ragged(
-        hidden_sources[0],
-        hidden_sources[1],
-        hidden_sources[2],
-        algorithm.draft_model.input_layer.condition_proj.weight,
-        source_rows[:active_count],
-        source_lengths[:active_count],
+    condition = _project_initial_ragged_condition(
+        algorithm,
+        hidden_sources,
+        source_rows,
+        source_lengths,
         starts,
         lengths,
         max_positions,

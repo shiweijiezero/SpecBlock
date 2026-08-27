@@ -238,6 +238,44 @@ class SpecBlockBatchSamplingTest(unittest.TestCase):
                     [hidden, hidden, hidden], 1.0,
                 )
 
+    def test_initial_condition_fallback_handles_nonzero_chunk_offset(self):
+        hidden_sources = [
+            torch.arange(8, dtype=torch.float32).reshape(1, 4, 2) + offset
+            for offset in (0, 10, 20)
+        ]
+        weight = torch.arange(12, dtype=torch.float32).reshape(2, 6)
+        algorithm = SimpleNamespace(
+            draft_model=SimpleNamespace(
+                input_layer=SimpleNamespace(
+                    condition_proj=SimpleNamespace(weight=weight)
+                )
+            )
+        )
+        source_rows = torch.tensor([0])
+        source_lengths = torch.tensor([4])
+        starts = torch.tensor([2])
+        lengths = torch.tensor([3])
+        capabilities = SimpleNamespace(needs_ragged_condition_fallback=True)
+
+        with mock.patch.object(module, "RUNTIME_CAPABILITIES", capabilities):
+            actual = module._project_initial_ragged_condition(
+                algorithm,
+                hidden_sources,
+                source_rows,
+                source_lengths,
+                starts,
+                lengths,
+                max_positions=3,
+            )
+
+        positions = torch.tensor([2, 3, 3])
+        condition_input = torch.cat(
+            [source[0, positions] for source in hidden_sources],
+            dim=-1,
+        ).unsqueeze(0)
+        expected = torch.nn.functional.linear(condition_input, weight)
+        self.assertTrue(torch.equal(actual, expected))
+
     def test_b16_b32_kv_compaction_preserves_surviving_rows(self):
         for batch_size in (16, 32):
             cache = module._DenseTargetCache(1, batch_size, 2, 4, 3)
