@@ -25,11 +25,13 @@ class BaselineAlgorithm(BaseAlgorithm):
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        attention_backend = os.environ.get("BASELINE_ATTN_IMPL", "eager")
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
             torch_dtype=torch.bfloat16,
             device_map=self.device,
-            trust_remote_code=True
+            trust_remote_code=True,
+            attn_implementation=attention_backend,
         )
         self.model.eval()
 

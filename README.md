@@ -96,7 +96,7 @@ python benchmarks_hf/run_eval.py \
 python benchmarks_hf/analyze_results.py ./hf_results/specblock_llama.jsonl
 ```
 
-Supported `--algorithm` values: `baseline`, `eagle3`, `specblock`. The benchmark list above matches the paper (HumanEval / MATH-500 / Alpaca / NQ / MT-Bench / WMT-23).
+Supported `--algorithm` values: `baseline`, `eagle3`, `specblock`. The benchmark list above matches the paper (HumanEval / MATH-500 / Alpaca / NQ / MT-Bench / WMT-23). The vanilla baseline defaults to Hugging Face eager attention to reproduce the paper protocol; set `BASELINE_ATTN_IMPL=sdpa` to use the faster modern SDPA baseline instead.
 
 #### MetaX C500
 
