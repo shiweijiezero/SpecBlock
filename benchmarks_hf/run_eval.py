@@ -5,10 +5,12 @@ import argparse
 import json
 import os
 from pathlib import Path
+import random
 import socket
 import sys
 import time
 
+import torch
 from tqdm import tqdm
 
 # Add parent directory to path to import modules
@@ -305,25 +307,50 @@ def main():
                 print(f"  Temperature: {temp}")
                 print(f"{'='*60}")
 
-                # Warm one complete engine batch, then measure every requested sample.
-                # Re-running the warmup rows keeps --benchmark-list dataset:N honest
-                # even when N is exactly one engine batch (for example B=16, N=16).
-                warmup_samples = data[:batch_size]
-                if warmup_samples:
-                    warmup_responses = algorithm.generate(
-                        warmup_samples,
-                        max_new_tokens=args.max_new_tokens,
-                        temperature=temp,
+                # Warm one complete engine batch. Compiled B=1 SpecBlock also
+                # replays the first few real requests individually so one-off
+                # rejection/tree branches compile before measured generation.
+                warmup_count = batch_size
+                if (
+                    batch_size == 1
+                    and args.algorithm in {"specblock", "specblock_shift"}
+                    and os.environ.get("DRAFT_COMPILE", "0") in {"1", "2"}
+                ):
+                    warmup_count = int(
+                        os.environ.get("SPECBLOCK_COMPILE_WARMUP_SAMPLES", "3")
                     )
-                    if len(warmup_responses) != len(warmup_samples):
-                        raise RuntimeError(
-                            f"{args.algorithm}.generate returned "
-                            f"{len(warmup_responses)} warmup responses for "
-                            f"{len(warmup_samples)} requests"
+                    if warmup_count <= 0:
+                        raise ValueError(
+                            "SPECBLOCK_COMPILE_WARMUP_SAMPLES must be positive"
                         )
-                reset_after_warmup = getattr(algorithm, "reset_after_warmup", None)
-                if reset_after_warmup is not None:
-                    reset_after_warmup()
+                warmup_samples = data[:min(len(data), warmup_count)]
+                python_rng_state = random.getstate()
+                torch_rng_state = torch.random.get_rng_state()
+                cuda_rng_states = (
+                    torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+                )
+                try:
+                    for start in range(0, len(warmup_samples), batch_size):
+                        warmup_batch = warmup_samples[start:start + batch_size]
+                        warmup_responses = algorithm.generate(
+                            warmup_batch,
+                            max_new_tokens=args.max_new_tokens,
+                            temperature=temp,
+                        )
+                        if len(warmup_responses) != len(warmup_batch):
+                            raise RuntimeError(
+                                f"{args.algorithm}.generate returned "
+                                f"{len(warmup_responses)} warmup responses for "
+                                f"{len(warmup_batch)} requests"
+                            )
+                finally:
+                    reset_after_warmup = getattr(algorithm, "reset_after_warmup", None)
+                    if reset_after_warmup is not None:
+                        reset_after_warmup()
+                    random.setstate(python_rng_state)
+                    torch.random.set_rng_state(torch_rng_state)
+                    if cuda_rng_states is not None:
+                        torch.cuda.set_rng_state_all(cuda_rng_states)
 
                 # Track metrics for this dataset
                 start_time = time.time()
@@ -351,6 +378,7 @@ def main():
                 total_target_verify_lm_head_rows = 0
                 total_target_verify_lm_head_capacity = 0
                 measured_samples = 0
+                target_time_includes_verify = False
 
                 results = []
                 pbar = tqdm(total=len(data), desc=f"{dataset_name} T={temp}", unit="sample")
@@ -404,6 +432,10 @@ def main():
                     for sample, response in zip(batch_samples, responses):
                         metrics = response["metrics"]
                         total_tokens += metrics["total_tokens"]
+                        target_time_includes_verify = (
+                            target_time_includes_verify
+                            or bool(metrics.get("target_time_includes_verify", False))
+                        )
                         if "accept_length" in metrics:
                             accept_lengths.append(metrics["accept_length"])
                         if "accept_rate" in metrics:
@@ -593,6 +625,7 @@ def main():
                     "draft_time": float(f"{total_draft_time:.2f}") if total_draft_time > 0 else None,
                     "target_time": float(f"{total_target_time:.2f}") if total_target_time > 0 else None,
                     "verify_time": float(f"{total_verify_time:.2f}") if total_verify_time > 0 else None,
+                    "target_time_includes_verify": target_time_includes_verify,
                     "draft_pct": float(f"{draft_pct:.1f}") if draft_pct is not None else None,
                     "target_pct": float(f"{target_pct:.1f}") if target_pct is not None else None,
                     "verify_pct": float(f"{verify_pct:.1f}") if verify_pct is not None else None,
@@ -621,11 +654,25 @@ def main():
                     if avg_draft_ms is not None:
                         avg_time_parts.append(f"draft={avg_draft_ms:.1f}ms")
                     if avg_target_ms is not None:
-                        avg_time_parts.append(f"target={avg_target_ms:.1f}ms")
+                        target_label = (
+                            "target+verify"
+                            if target_time_includes_verify
+                            else "target"
+                        )
+                        avg_time_parts.append(f"{target_label}={avg_target_ms:.1f}ms")
                     if avg_verify_ms is not None and avg_verify_ms > 0:
                         avg_time_parts.append(f"verify={avg_verify_ms:.1f}ms")
                     avg_time_str = " ".join(avg_time_parts)
-                    time_str = f", draft={draft_pct:.1f}% target={target_pct:.1f}% verify={verify_pct:.1f}%, avg/iter: {avg_time_str}"
+                    target_pct_label = (
+                        "target+verify"
+                        if target_time_includes_verify
+                        else "target"
+                    )
+                    time_str = (
+                        f", draft={draft_pct:.1f}% "
+                        f"{target_pct_label}={target_pct:.1f}% "
+                        f"verify={verify_pct:.1f}%, avg/iter: {avg_time_str}"
+                    )
                 print(f"    {dataset_name}: tokens={total_tokens}, "
                       f"acc_len={acc_len_str}, acc_rate={acc_rate_str}, "
                       f"duration={duration:.2f}s, throughput={throughput:.2f} tok/s{time_str}", flush=True)

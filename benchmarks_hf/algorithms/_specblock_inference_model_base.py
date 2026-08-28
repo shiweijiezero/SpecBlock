@@ -1897,8 +1897,17 @@ class _SpecBlockInferenceModelBase(nn.Module):
         # Last chunk + draft position merged into one forward
         merged_h = torch.cat([hidden_3h[:, last_chunk_start:S, :], draft_hidden_3h], dim=1)
         merged_ids = torch.cat([input_ids[:, last_chunk_start:S], draft_input_id], dim=1)
-        logits, rank_logits, draft_hidden, ttt_kv, new_pos = \
-            self.update_cache_and_draft(merged_h, merged_ids, cache, last_chunk_start)
+        initial_update = getattr(
+            self,
+            "update_cache_and_draft_eager",
+            self.update_cache_and_draft,
+        )
+        logits, rank_logits, draft_hidden, ttt_kv, new_pos = initial_update(
+            merged_h,
+            merged_ids,
+            cache,
+            last_chunk_start,
+        )
 
         # Optional prompt compaction (same as `prefill`). Compacts only the S prompt
         # positions; the first-draft position (written at end by update_cache_and_draft)

@@ -44,8 +44,8 @@ def _detect_runtime_capabilities() -> RuntimeCapabilities:
             three_part_attention_block_n=16,
             three_part_attention_num_warps=1,
             three_part_attention_num_stages=1,
-            draft_compile_default="0",
-            internal_prewarm_default="0",
+            draft_compile_default="2",
+            internal_prewarm_default="1",
             needs_ragged_condition_fallback=True,
         )
     return RuntimeCapabilities()

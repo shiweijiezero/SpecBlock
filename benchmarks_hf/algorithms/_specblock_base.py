@@ -731,6 +731,14 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         """Batch samples by conversation turn without serial target forwards."""
         if self.tokenizer is None:
             self.load_model()
+        if len(samples) == 1 and os.environ.get("DRAFT_COMPILE", "0") in {"1", "2"}:
+            return BaseAlgorithm.generate(
+                self,
+                samples,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                **kwargs,
+            )
         if not self.supports_true_batch:
             if len(samples) > 1:
                 raise NotImplementedError(
@@ -1147,19 +1155,45 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         self.draft_model.prefill(dummy_h3, dummy_ids)
 
         # update_cache_and_draft warmup (B=1, various N)
-        for N_update in [2, 3, 4, 5]:
-            cache = self.draft_model.reset_cache(max_cache_len=64 * K)
-            # Prefill 1 position first
-            self.draft_model.prefill(dummy_h3[:, :1, :], dummy_ids[:, :1], chunk_size=1)
+        for N_update in range(1, 11):
+            # Prefill one position and reuse the initialized cache so the
+            # compiled decode path never sees the lazy-allocation branch.
+            cache, _ = self.draft_model.prefill(
+                dummy_h3[:, :1, :],
+                dummy_ids[:, :1],
+                chunk_size=1,
+            )
             dummy_h3_n = torch.zeros(1, N_update, H3, device=device, dtype=torch.bfloat16)
             dummy_ids_n = torch.zeros(1, N_update, device=device, dtype=torch.long)
             self.draft_model.update_cache_and_draft(dummy_h3_n, dummy_ids_n, cache, 1)
 
-        # forward_with_cache warmup for all batch sizes N=1..max_N
+        # Block-1 rebuild after a full rejection uses the 3H condition path,
+        # no TTT cache, and writes the new position into cross-cache.
+        block1_cache, _ = self.draft_model.prefill(
+            dummy_h3[:, :1, :],
+            dummy_ids[:, :1],
+            chunk_size=1,
+        )
+        self.draft_model.forward_with_cache(
+            hidden=dummy_h3[:, :1, :],
+            input_ids=dummy_ids[:, :1],
+            cache=block1_cache,
+            position_id=1,
+            use_draft_condition=False,
+            ttt_cache=None,
+            ttt_mask=None,
+            update_cross_cache=True,
+        )
+
+        # forward_with_cache warmup for all block-2 batch sizes N=1..max_N
         for N in range(1, max_N + 1):
-            cache = self.draft_model.reset_cache(max_cache_len=64 * K)
-            # Prefill 1 position to initialize cache (stores K entries in cross cache)
-            self.draft_model.prefill(dummy_h3[:, :1, :], dummy_ids[:, :1], chunk_size=1)
+            # Prefill one position, then expose the three-field cache contract
+            # used by the real block-2 decode path.
+            cache, _ = self.draft_model.prefill(
+                dummy_h3[:, :1, :],
+                dummy_ids[:, :1],
+                chunk_size=1,
+            )
             cross_count = K
             cross_cache = []
             for lc in cache:
@@ -1184,6 +1218,13 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
                 for _ in range(num_layers)
             ]
             dummy_ttt_mask = torch.ones(N, K, device=device, dtype=torch.bool)
+            full_kv_mask = torch.cat(
+                [
+                    torch.ones(N, cross_count, device=device, dtype=torch.bool),
+                    dummy_ttt_mask,
+                ],
+                dim=1,
+            )
 
             self.draft_model.forward_with_cache(
                 hidden=dummy_hidden, input_ids=dummy_input,
@@ -1191,6 +1232,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
                 use_draft_condition=True,
                 ttt_cache=dummy_ttt, ttt_mask=dummy_ttt_mask,
                 update_cross_cache=False,
+                full_kv_mask=full_kv_mask,
             )
 
         torch.cuda.synchronize()
@@ -5097,15 +5139,385 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         conversation: List[Dict[str, str]],
         max_new_tokens: int,
         temperature: float,
-        **kwargs,
+        **kwargs
     ) -> Dict:
-        """Generate B=1 through the same request-level batch core."""
-        return self.generate_conversations(
-            [conversation],
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            **kwargs,
-        )[0]
+        """Generate response using SpecBlock tree speculative decoding."""
+        prompt = self.tokenizer.apply_chat_template(
+            conversation, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(self.device)
+        input_ids = inputs.input_ids
+        input_length = input_ids.shape[1]
+
+        max_iterations = max_new_tokens + 10
+        self._ensure_events_pool(max_iterations)
+
+        iterations = 0
+        draft_events = 0
+        accept_lengths_raw = []
+        all_iter_rank_stats = []
+        # Store raw data for deferred block-pos stats computation
+        all_iter_bp_raw = []
+        self._block_forward_events = defaultdict(list)
+
+        # Pre-allocate input_ids buffer to avoid repeated torch.cat
+        max_total_len = input_length + max_new_tokens + 16
+        input_ids_buf = torch.zeros(1, max_total_len, dtype=torch.long, device=self.device)
+        input_ids_buf[0, :input_length] = input_ids[0]
+        cur_len = input_length
+
+        # Use CUDA events for consistent wall time measurement
+        _wall_start_event = torch.cuda.Event(enable_timing=True)
+        _wall_end_event = torch.cuda.Event(enable_timing=True)
+
+        # Pre-allocate block timing events to avoid per-iteration allocation
+        _blk0_starts = [torch.cuda.Event(enable_timing=True) for _ in range(max_iterations)]
+        _blk0_ends = [torch.cuda.Event(enable_timing=True) for _ in range(max_iterations)]
+        _blk0_count = 0
+
+
+        with torch.no_grad():
+            # === Prefill ===
+            _wall_start_event.record()
+            self._events_pool['prefill_start'].record()
+
+            target_outputs = self.target_model(
+                input_ids,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+            past_key_values = target_outputs.past_key_values
+            all_hidden_states = target_outputs.hidden_states
+            prefill_logits = target_outputs.logits
+
+            hidden_3h = self._extract_hidden_3h(all_hidden_states)
+
+            if temperature > 0:
+                probs = F.softmax(prefill_logits[:, -1, :] / temperature, dim=-1)
+                first_token = torch.multinomial(probs, num_samples=1)
+            else:
+                first_token = torch.argmax(prefill_logits[:, -1, :], dim=-1, keepdim=True)
+
+            last_hidden_3h = hidden_3h[:, -1:, :]
+
+            # Check EOS
+            if first_token[0, 0] == self.tokenizer.eos_token_id:
+                torch.cuda.synchronize()
+                input_ids_buf[0, cur_len] = first_token[0, 0]
+                cur_len += 1
+                output_ids = input_ids_buf[0, input_length:cur_len]
+                return {
+                    "output": self.tokenizer.decode(output_ids, skip_special_tokens=True),
+                    "metrics": {
+                        "total_tokens": len(output_ids),
+                        "wall_time": 0, "tokens_per_second": 0,
+                        "accept_length": 0, "iterations": 0,
+                    }
+                }
+
+            current_token = first_token
+
+            # Merged draft prefill + first draft (saves one forward pass)
+            shifted_input_ids = torch.cat([input_ids[:, 1:], first_token], dim=1)
+            draft_cache, draft_position, b0_logits, b0_rank_logits, b0_draft_hidden, b0_ttt_kv = \
+                self.draft_model.prefill_and_draft(
+                    hidden_3h, shifted_input_ids, last_hidden_3h, current_token,
+                )
+
+            self._events_pool['prefill_end'].record()
+
+            # === First Draft tree building (no separate forward needed) ===
+            self._events_pool['draft_start'][0].record()
+
+            draft_tokens, tree_mask, tree_position_ids, retrieve_indices, iter_rank_stats, node_ranks, node_block_slots = \
+                self._build_tree_from_block1_dispatch(
+                    b0_logits, b0_rank_logits, b0_draft_hidden, b0_ttt_kv,
+                    current_token, draft_cache, draft_position - 1,
+                    temperature=temperature,
+                )
+
+            self._events_pool['draft_end'][0].record()
+            draft_events = 1
+
+            # === OnlineAdapt hook: tree just built (initial) ===
+            _adapt_hooks = getattr(self, '_adapt_hooks', None)
+            if _adapt_hooks is not None:
+                _adapt_hooks.on_tree_built(
+                    draft_tokens=draft_tokens, logits=b0_logits,
+                    rank_logits=b0_rank_logits, draft_hidden=b0_draft_hidden,
+                    node_ranks=node_ranks, node_block_slots=node_block_slots,
+                    retrieve_indices=retrieve_indices,
+                )
+
+            # === Decode Loop ===
+            eos_token_id = self.tokenizer.eos_token_id
+            while (cur_len - input_length) < max_new_tokens:
+                _nv_push(f"iter{iterations}")
+                # 1. Verify + Update + Draft in tight sequence
+                input_ids = input_ids_buf[:, :cur_len]
+                self._events_pool['target_start'][iterations].record()
+
+                _nv_push("target_verify")
+                (
+                    accept_length, accepted_token_ids, next_token,
+                    past_key_values, last_hidden_3h, lazy_hidden_3h,
+                    best_candidate, ret_indices, target_choices_cpu,
+                ) = self._tree_verify(
+                    draft_tokens, tree_mask, tree_position_ids, retrieve_indices,
+                    input_ids, past_key_values, temperature,
+                )
+                _nv_pop()
+
+                self._events_pool['target_end'][iterations].record()
+
+                # === OnlineAdapt hook: verify event (target responded) ===
+                if _adapt_hooks is not None:
+                    _adapt_hooks.on_verify(
+                        iteration=iterations,
+                        accept_length=int(accept_length.item()) if torch.is_tensor(accept_length) else int(accept_length),
+                        best_candidate=best_candidate, ret_indices=ret_indices,
+                        target_choices_cpu=target_choices_cpu,
+                        last_hidden_3h=last_hidden_3h, lazy_hidden_3h=lazy_hidden_3h,
+                        tree_logits_gpu=getattr(self, '_adapt_tree_logits_gpu', None),
+                        input_ids_buf=input_ids_buf,  # Phase 4D v15c: context for full-param training
+                        cur_len=cur_len,
+                    )
+
+                # 2. Commit only tokens that fit the remaining request budget.
+                remaining = max_new_tokens - (cur_len - input_length)
+                verified_accept_length = (
+                    int(accept_length.item())
+                    if torch.is_tensor(accept_length)
+                    else int(accept_length)
+                )
+                accept_length = min(verified_accept_length, remaining)
+                commit_bonus = accept_length < remaining
+                accepted_token_ids = accepted_token_ids[:accept_length]
+                if accept_length > 0:
+                    input_ids_buf[0, cur_len:cur_len + accept_length] = accepted_token_ids
+                    cur_len += accept_length
+                if commit_bonus:
+                    input_ids_buf[0, cur_len] = next_token[0, 0]
+                    cur_len += 1
+
+                # Online n-gram update: for each consecutive (a, b) → c pair in
+                # the tokens added this iter, increment table count. Uses last
+                # two tokens from input_ids_buf as context.
+                if self._ngram_cache_on and cur_len >= 3:
+                    # Pull new tokens (accepted + bonus) onto CPU once per iter
+                    _nt_end = cur_len
+                    _nt_start = max(
+                        0,
+                        cur_len - int(accept_length) - int(commit_bonus),
+                    )  # start of this iter's writes
+                    # Include previous 2 tokens as context for first pair
+                    _ctx_start = max(0, _nt_start - 2)
+                    _seq = input_ids_buf[0, _ctx_start:_nt_end].tolist()
+                    for i in range(len(_seq) - 2):
+                        a, b, c = int(_seq[i]), int(_seq[i + 1]), int(_seq[i + 2])
+                        tbl = self._ngram_table.setdefault((a, b), {})
+                        tbl[c] = tbl.get(c, 0) + 1
+                    # Remember last 2 tokens for next iter's tree-build query
+                    if cur_len >= 2:
+                        self._ngram_prev2 = (int(input_ids_buf[0, cur_len - 2].item()),
+                                             int(input_ids_buf[0, cur_len - 1].item()))
+
+                # Defer coverage stats — both tensors use non_blocking transfers, no hot-path sync
+                draft_tokens_cpu = draft_tokens.to('cpu', non_blocking=True)
+                all_iter_bp_raw.append((node_block_slots, ret_indices, best_candidate, accept_length,
+                                        draft_tokens_cpu, target_choices_cpu))
+                accept_lengths_raw.append(accept_length)
+                all_iter_rank_stats.append(iter_rank_stats)
+                iterations += 1
+
+                # EOS check — no .item() sync, stay on GPU.
+                if commit_bonus:
+                    if accept_length > 0:
+                        all_tokens = torch.cat([accepted_token_ids, next_token[0]])
+                    else:
+                        all_tokens = next_token[0]
+                else:
+                    all_tokens = accepted_token_ids
+                eos_flag = (all_tokens == eos_token_id).any()
+
+                if (cur_len - input_length) >= max_new_tokens:
+                    _nv_pop()  # close iter
+                    break
+
+                # 3. Draft Phase: launch immediately, check EOS AFTER draft to overlap
+                self._events_pool['draft_start'][draft_events].record()
+
+                if accept_length == 0:
+                    # Nothing accepted: pop failed position, rebuild from scratch
+                    self.draft_model.pop_cache(draft_cache)
+                    draft_tokens, tree_mask, tree_position_ids, retrieve_indices, iter_rank_stats, node_ranks, node_block_slots = \
+                        self._build_draft_tree(
+                            last_hidden_3h, next_token,
+                            draft_cache, draft_position,
+                            temperature=temperature,
+                        )
+                else:
+                    # lazy_hidden_3h: [1, accept_length+1, 3H] (accepted + last)
+                    batch_h = lazy_hidden_3h  # [1, accept_length+1, 3H]
+
+                    # Tokens: shifted by 1 → [accepted_tokens[1:], next_token, next_token]
+                    if accept_length == 1:
+                        batch_tok = torch.cat([next_token, next_token], dim=1)  # [1, 2]
+                    else:
+                        batch_tok = torch.cat([
+                            accepted_token_ids[1:].unsqueeze(0),
+                            next_token, next_token
+                        ], dim=1)
+
+                    # Record per-block timing for block 0 (update_cache_and_draft)
+                    _blk0_starts[_blk0_count].record()
+
+                    _nv_push("update_cache_and_draft")
+                    _upd_out = None
+                    if (self._draft_graph_cache is not None
+                            and os.environ.get('DRAFT_CUDA_GRAPH_UPD', '0') == '1'):
+                        try:
+                            _upd_out = self._draft_graph_cache.run_update_cache(
+                                hidden_3h=batch_h,
+                                input_ids=batch_tok,
+                                draft_cache=draft_cache,
+                                start_position=draft_position + 1,
+                            )
+                        except Exception:
+                            _upd_out = None
+
+                    if _upd_out is not None:
+                        logits, rank_logits, draft_hidden, ttt_kv, draft_position = _upd_out
+                    else:
+                        logits, rank_logits, draft_hidden, ttt_kv, draft_position = \
+                            self.draft_model.update_cache_and_draft(
+                                batch_h, batch_tok, draft_cache, draft_position + 1
+                            )
+                    _nv_pop()
+
+                    _blk0_ends[_blk0_count].record()
+                    self._block_forward_events[0].append((_blk0_starts[_blk0_count], _blk0_ends[_blk0_count]))
+                    _blk0_count += 1
+
+                    _nv_push("build_tree")
+                    draft_tokens, tree_mask, tree_position_ids, retrieve_indices, iter_rank_stats, node_ranks, node_block_slots = \
+                        self._build_tree_from_block1_dispatch(
+                            logits, rank_logits, draft_hidden, ttt_kv,
+                            next_token, draft_cache, draft_position - 1,
+                            temperature=temperature,
+                        )
+                    _nv_pop()
+
+                    # === OnlineAdapt hook: tree just built (iter) ===
+                    if _adapt_hooks is not None:
+                        _adapt_hooks.on_tree_built(
+                            draft_tokens=draft_tokens, logits=logits,
+                            rank_logits=rank_logits, draft_hidden=draft_hidden,
+                            node_ranks=node_ranks, node_block_slots=node_block_slots,
+                            retrieve_indices=retrieve_indices,
+                        )
+
+                self._events_pool['draft_end'][draft_events].record()
+                draft_events += 1
+
+                current_token = next_token
+
+                # Check EOS after draft (eos_flag computed on GPU before draft, .item() overlaps)
+                _nv_pop()  # close iter
+                if eos_flag.item():
+                    break
+
+        # Compute timing (all CUDA events, same clock)
+        _wall_end_event.record()
+        torch.cuda.synchronize()
+
+        wall_time = _wall_start_event.elapsed_time(_wall_end_event) / 1000.0
+
+        prefill_time = self._events_pool['prefill_start'].elapsed_time(
+            self._events_pool['prefill_end']
+        ) / 1000.0
+
+        draft_time = sum(
+            self._events_pool['draft_start'][i].elapsed_time(self._events_pool['draft_end'][i])
+            for i in range(draft_events)
+        ) / 1000.0 if draft_events > 0 else 0.0
+
+        target_time = sum(
+            self._events_pool['target_start'][i].elapsed_time(self._events_pool['target_end'][i])
+            for i in range(iterations)
+        ) / 1000.0 if iterations > 0 else 0.0
+
+        other_time = max(0, wall_time - prefill_time - draft_time - target_time)
+
+        # Compute per-block forward times
+        draft_forward_times = {}
+        for depth, events in self._block_forward_events.items():
+            draft_forward_times[depth] = sum(
+                s.elapsed_time(e) for s, e in events
+            ) / 1000.0
+
+        output_ids = input_ids_buf[0, input_length:cur_len]
+        output_text = self.tokenizer.decode(output_ids, skip_special_tokens=True)
+        num_tokens = len(output_ids)
+
+        # Compute deferred coverage stats (all CPU work, after generation loop)
+        # Tensors from non_blocking transfers are guaranteed resolved after torch.cuda.synchronize() above
+        all_iter_block_pos_stats = [
+            self._compute_coverage_stats(dt, tc, ri, nbs)
+            for nbs, ri, bc, al, dt, tc in all_iter_bp_raw
+        ]
+
+        # Aggregate rank stats
+        rank_stats = self._aggregate_rank_stats(all_iter_rank_stats, accept_lengths_raw)
+        block_pos_stats = self._aggregate_block_pos_stats(all_iter_block_pos_stats)
+
+        # === OnlineAdapt hook: query end (routing decision + training) ===
+        # Day 26 v6 (2026-04-26): expose CUDA-event-measured timing breakdown
+        # so hooks can size head batch by measured per-iter inference cost
+        # rather than wall_time / iterations rough estimate. prefill/draft/
+        # target/other already computed above (lines 4411-4427) using CUDA
+        # events; pass through so hooks.on_query_end's adaptive batch sizer
+        # has access to real per-iter target+draft GPU time.
+        if _adapt_hooks is not None:
+            _adapt_hooks.on_query_end(
+                accept_lengths_raw=list(accept_lengths_raw),
+                iterations=iterations, wall_time=wall_time,
+                input_length=input_length,
+                num_generated=num_tokens,
+                input_ids_full=input_ids_buf[0, :cur_len].detach().cpu().clone(),  # v16: full seq for full-step
+                prompt_len=input_length,
+                prefill_time=prefill_time,
+                draft_time=draft_time,
+                target_time=target_time,
+                other_time=other_time,
+            )
+
+        return {
+            "output": output_text,
+            "metrics": {
+                "total_tokens": num_tokens,
+                "output_token_ids": output_ids.detach().cpu().tolist(),
+                "wall_time": wall_time,
+                "tokens_per_second": num_tokens / wall_time if wall_time > 0 else 0,
+                "accept_length": self.compute_accept_length(accept_lengths_raw),
+                "iterations": iterations,
+                "accept_lengths_raw": accept_lengths_raw,
+                "prefill_time": prefill_time,
+                "draft_time": draft_time,
+                # Legacy B1 times target forward and acceptance together.
+                "target_time": target_time,
+                "verify_time": 0.0,
+                "target_time_includes_verify": True,
+                "other_time": other_time,
+                "draft_pct": draft_time / wall_time * 100 if wall_time > 0 else 0,
+                "target_pct": target_time / wall_time * 100 if wall_time > 0 else 0,
+                "verify_pct": 0.0,
+                "draft_forward_times": draft_forward_times,
+                "tree_profile": getattr(self, '_last_tree_profile', {}),
+                "rank_stats": rank_stats,
+                "block_pos_stats": block_pos_stats,
+            }
+        }
 
     def _generate_once_streaming(
         self,
@@ -5454,10 +5866,14 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
                 "accept_lengths_raw": accept_lengths_raw,
                 "prefill_time": prefill_time,
                 "draft_time": draft_time,
+                # Legacy B1 times target forward and acceptance together.
                 "target_time": target_time,
+                "verify_time": 0.0,
+                "target_time_includes_verify": True,
                 "other_time": other_time,
                 "draft_pct": draft_time / wall_time * 100 if wall_time > 0 else 0,
                 "target_pct": target_time / wall_time * 100 if wall_time > 0 else 0,
+                "verify_pct": 0.0,
                 "draft_forward_times": draft_forward_times,
                 "tree_profile": getattr(self, '_last_tree_profile', {}),
                 "rank_stats": rank_stats,

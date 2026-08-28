@@ -123,9 +123,26 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         if _compile_mode in ('1', '2'):
             _mode_name = 'reduce-overhead' if _compile_mode == '1' else 'default'
             print(f"  [DRAFT_COMPILE={_compile_mode}] torch.compile(mode='{_mode_name}')")
+            cache_limit = int(os.environ.get("DYNAMO_CACHE_LIMIT", "32"))
+            if cache_limit <= 0:
+                raise ValueError("DYNAMO_CACHE_LIMIT must be positive")
+            torch._dynamo.config.cache_size_limit = max(
+                torch._dynamo.config.cache_size_limit,
+                cache_limit,
+            )
+            torch._dynamo.config.accumulated_cache_size_limit = max(
+                torch._dynamo.config.accumulated_cache_size_limit,
+                cache_limit * 4,
+            )
             _compile_kwargs = dict(dynamic=True)
             if _compile_mode == '1':
                 _compile_kwargs['mode'] = 'reduce-overhead'
+            # Initial prompt prefill starts from an unallocated cache and is not
+            # part of the repeated decode hot path. Keep its update eager so the
+            # compiled function only sees initialized, decode-time cache state.
+            self.draft_model.update_cache_and_draft_eager = (
+                self.draft_model.update_cache_and_draft
+            )
             # Compiling the inference copy preserves parameter identity while
             # avoiding retracing across repeated decoding iterations.
             self.draft_model.forward_with_cache = torch.compile(
@@ -166,6 +183,12 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         import numpy as _np
         self._arange_K_np = _np.arange(self.K, dtype=_np.int64)
         self._arange_K_t = torch.arange(self.K, device=self.device)
+
+        if (
+            _compile_mode in {"1", "2"}
+            and os.environ.get("SPECBLOCK_INTERNAL_PREWARM", "1") == "1"
+        ):
+            self._warmup_draft_kernels()
 
         self._init_draft_cuda_graph()
 
@@ -208,7 +231,10 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         # Replaces the older `--benchmark-list hu:3 <target>` CLI prewarm hack
         # and the now-removed DRAFT_WARMUP opt-in modes. Disable via
         # SPECBLOCK_INTERNAL_PREWARM=0.
-        if os.environ.get('SPECBLOCK_INTERNAL_PREWARM', '1') == '1':
+        if (
+            _compile_mode not in {"1", "2"}
+            and os.environ.get("SPECBLOCK_INTERNAL_PREWARM", "1") == "1"
+        ):
             self._internal_prewarm()
 
         print(f"SpecBlock Shift ready! K={self.K}, max_blocks={self.max_blocks}, "
