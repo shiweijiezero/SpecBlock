@@ -113,7 +113,13 @@ An ABI-compatible `sgl_kernel.so` built from MetaX `mcoplib` enables fused SiLU,
 export SPECBLOCK_SGL_KERNEL_LIBRARY=/path/to/sgl_kernel.so
 ```
 
-The library is optional; SpecBlock falls back to native PyTorch operators when it is not configured. MetaX defaults to eager draft execution, while an explicit `DRAFT_COMPILE=1` or `DRAFT_COMPILE=2` still overrides that default.
+The library is optional; SpecBlock falls back to native PyTorch operators when it is not configured. MetaX defaults to `DRAFT_COMPILE=2`; set `DRAFT_COMPILE=0 SPECBLOCK_INTERNAL_PREWARM=0` for the faster eager path on the current C500 stack. An experimental B=1 hybrid keeps batched target verification while using the compiled scalar draft path:
+
+```bash
+export SPECBLOCK_HYBRID_B1=1
+```
+
+The hybrid path currently targets greedy evaluation only and remains opt-in because compiled and eager draft numerics can produce different generation trajectories near target argmax boundaries.
 
 ### Stage 6 — Interactive UI
 

@@ -25,6 +25,7 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
     _PARETO_DEFAULTS = {
         # Draft kernel / tree build
         'DRAFT_COMPILE':            RUNTIME_CAPABILITIES.draft_compile_default,
+        'SPECBLOCK_HYBRID_B1':      '0',         # experimental MetaX hybrid; opt in explicitly
         'TREE_ATTN_TRITON':         '1',         # triton attn kernel for draft
         'TREE_ATTN_SDPA':           '0',         # 关掉 SDPA (TRITON 赢在 short prompt)
         'TREE_BUILD_TRITON':        '1',         # triton mega tree build

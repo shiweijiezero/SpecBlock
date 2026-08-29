@@ -2055,6 +2055,12 @@ def generate_conversations(
 ) -> List[Dict]:
     """Generate a request batch with one target tree forward per active round."""
     sampling = temperature > 1e-5
+    use_legacy_compiled_b1 = (
+        len(conversations) == 1
+        and not sampling
+        and os.environ.get("DRAFT_COMPILE", "0") in {"1", "2"}
+        and os.environ.get("SPECBLOCK_HYBRID_B1", "0") == "1"
+    )
     if getattr(algorithm, "_adapt_hooks", None) is not None:
         raise NotImplementedError(
             "online adaptation hooks are not request-batch aware yet"
@@ -2243,14 +2249,27 @@ def generate_conversations(
     del first_tokens, first_token_ids
     draft_cache = None
     if initial_entries:
-        draft_cache = _build_initial_drafts_batched(
-            algorithm,
-            initial_entries,
-            hidden_sources,
-            max_new_tokens,
-            original_engine_b1=len(conversations) == 1,
-            temperature=temperature,
-        )
+        if use_legacy_compiled_b1:
+            if len(initial_entries) != 1:
+                raise RuntimeError("compiled B1 draft requires exactly one active request")
+            source_idx, state = initial_entries[0]
+            prompt_hidden = torch.cat(
+                [
+                    source[source_idx:source_idx + 1, :state.prompt_len]
+                    for source in hidden_sources
+                ],
+                dim=-1,
+            )
+            _build_initial_draft(algorithm, state, prompt_hidden)
+        else:
+            draft_cache = _build_initial_drafts_batched(
+                algorithm,
+                initial_entries,
+                hidden_sources,
+                max_new_tokens,
+                original_engine_b1=len(conversations) == 1,
+                temperature=temperature,
+            )
     del hidden_sources
     phase_timer.stop("draft", initial_draft_start)
 
@@ -2437,13 +2456,20 @@ def generate_conversations(
         phase_timer.stop("verify", commit_start)
         if next_active:
             draft_start = phase_timer.start()
-            draft_cache.compact_rows(next_active_rows)
-            _build_next_drafts_batched(
-                algorithm,
-                draft_cache,
-                next_active,
-                temperature=temperature,
-            )
+            if use_legacy_compiled_b1:
+                if len(next_active) != 1:
+                    raise RuntimeError(
+                        "compiled B1 draft rebuild requires one active request"
+                    )
+                _build_next_draft(algorithm, *next_active[0])
+            else:
+                draft_cache.compact_rows(next_active_rows)
+                _build_next_drafts_batched(
+                    algorithm,
+                    draft_cache,
+                    next_active,
+                    temperature=temperature,
+                )
             phase_timer.stop("draft", draft_start)
         active = [args[0] for args in next_active]
 

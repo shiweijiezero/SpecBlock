@@ -731,7 +731,14 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         """Batch samples by conversation turn without serial target forwards."""
         if self.tokenizer is None:
             self.load_model()
-        if len(samples) == 1 and os.environ.get("DRAFT_COMPILE", "0") in {"1", "2"}:
+        if (
+            len(samples) == 1
+            and os.environ.get("DRAFT_COMPILE", "0") in {"1", "2"}
+            and (
+                os.environ.get("SPECBLOCK_HYBRID_B1", "0") != "1"
+                or temperature > 1e-5
+            )
+        ):
             return BaseAlgorithm.generate(
                 self,
                 samples,
