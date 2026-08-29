@@ -18,6 +18,8 @@ class RuntimeCapabilities:
     draft_compile_default: str = "2"
     internal_prewarm_default: str = "1"
     needs_ragged_condition_fallback: bool = False
+    enable_target_projection_fusion: bool = False
+    target_gate_up_fuse_min_rows: int = 129
 
     def three_part_attention_launch_kwargs(self) -> dict[str, int]:
         kwargs = {}
@@ -47,6 +49,8 @@ def _detect_runtime_capabilities() -> RuntimeCapabilities:
             draft_compile_default="2",
             internal_prewarm_default="1",
             needs_ragged_condition_fallback=True,
+            enable_target_projection_fusion=True,
+            target_gate_up_fuse_min_rows=80,
         )
     return RuntimeCapabilities()
 

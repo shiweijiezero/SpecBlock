@@ -362,6 +362,8 @@ def main():
                 total_prefill_time = 0.0
                 total_draft_time = 0.0
                 total_target_time = 0.0
+                total_target_backbone_time = 0.0
+                total_target_lm_head_time = 0.0
                 total_verify_time = 0.0
                 total_wall_time = 0.0  # Sum of per-sample CUDA wall_time
                 total_iterations = 0
@@ -401,6 +403,12 @@ def main():
                     total_prefill_time += batch_metrics.get("prefill_time", 0.0)
                     total_draft_time += batch_metrics.get("draft_time", 0.0)
                     total_target_time += batch_metrics.get("target_time", 0.0)
+                    total_target_backbone_time += batch_metrics.get(
+                        "target_backbone_time", 0.0
+                    )
+                    total_target_lm_head_time += batch_metrics.get(
+                        "target_lm_head_time", 0.0
+                    )
                     total_verify_time += batch_metrics.get("verify_time", 0.0)
                     total_iterations += batch_metrics.get("iterations", 0)
                     all_active_sizes.extend(batch_metrics.get("active_sizes", []))
@@ -517,6 +525,14 @@ def main():
                 # Calculate average per-iteration times (in milliseconds)
                 avg_draft_ms = (total_draft_time / total_iterations * 1000) if total_iterations > 0 else None
                 avg_target_ms = (total_target_time / total_iterations * 1000) if total_iterations > 0 else None
+                avg_target_backbone_ms = (
+                    total_target_backbone_time / total_iterations * 1000
+                    if total_iterations > 0 else None
+                )
+                avg_target_lm_head_ms = (
+                    total_target_lm_head_time / total_iterations * 1000
+                    if total_iterations > 0 else None
+                )
                 avg_verify_ms = (total_verify_time / total_iterations * 1000) if total_iterations > 0 else None
 
                 # Calculate per-block average times (specblock only)
@@ -624,6 +640,8 @@ def main():
                     "prefill_time": float(f"{total_prefill_time:.2f}") if total_prefill_time > 0 else None,
                     "draft_time": float(f"{total_draft_time:.2f}") if total_draft_time > 0 else None,
                     "target_time": float(f"{total_target_time:.2f}") if total_target_time > 0 else None,
+                    "target_backbone_time": float(f"{total_target_backbone_time:.2f}") if total_target_backbone_time > 0 else None,
+                    "target_lm_head_time": float(f"{total_target_lm_head_time:.2f}") if total_target_lm_head_time > 0 else None,
                     "verify_time": float(f"{total_verify_time:.2f}") if total_verify_time > 0 else None,
                     "target_time_includes_verify": target_time_includes_verify,
                     "draft_pct": float(f"{draft_pct:.1f}") if draft_pct is not None else None,
@@ -632,6 +650,8 @@ def main():
                     "total_iterations": total_iterations,
                     "avg_draft_ms": float(f"{avg_draft_ms:.2f}") if avg_draft_ms is not None else None,
                     "avg_target_ms": float(f"{avg_target_ms:.2f}") if avg_target_ms is not None else None,
+                    "avg_target_backbone_ms": float(f"{avg_target_backbone_ms:.2f}") if avg_target_backbone_ms is not None else None,
+                    "avg_target_lm_head_ms": float(f"{avg_target_lm_head_ms:.2f}") if avg_target_lm_head_ms is not None else None,
                     "avg_verify_ms": float(f"{avg_verify_ms:.2f}") if avg_verify_ms is not None else None,
                     # Cumulative position accuracy
                     "position_accuracy": pos_acc_list,
@@ -660,6 +680,14 @@ def main():
                             else "target"
                         )
                         avg_time_parts.append(f"{target_label}={avg_target_ms:.1f}ms")
+                    if avg_target_backbone_ms is not None and avg_target_backbone_ms > 0:
+                        avg_time_parts.append(
+                            f"backbone={avg_target_backbone_ms:.1f}ms"
+                        )
+                    if avg_target_lm_head_ms is not None and avg_target_lm_head_ms > 0:
+                        avg_time_parts.append(
+                            f"lm_head={avg_target_lm_head_ms:.1f}ms"
+                        )
                     if avg_verify_ms is not None and avg_verify_ms > 0:
                         avg_time_parts.append(f"verify={avg_verify_ms:.1f}ms")
                     avg_time_str = " ".join(avg_time_parts)

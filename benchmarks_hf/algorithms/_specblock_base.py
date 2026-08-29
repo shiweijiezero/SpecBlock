@@ -853,6 +853,12 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
                     prefill_time = sum(row.get("prefill_time", 0.0) for row in rows)
                     draft_time = sum(row.get("draft_time", 0.0) for row in rows)
                     target_time = sum(row.get("target_time", 0.0) for row in rows)
+                    target_backbone_time = sum(
+                        row.get("target_backbone_time", 0.0) for row in rows
+                    )
+                    target_lm_head_time = sum(
+                        row.get("target_lm_head_time", 0.0) for row in rows
+                    )
                     verify_time = sum(row.get("verify_time", 0.0) for row in rows)
                     other_time = sum(row.get("other_time", 0.0) for row in rows)
                     context["result"] = {
@@ -873,6 +879,8 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
                             "prefill_time": prefill_time,
                             "draft_time": draft_time,
                             "target_time": target_time,
+                            "target_backbone_time": target_backbone_time,
+                            "target_lm_head_time": target_lm_head_time,
                             "verify_time": verify_time,
                             "other_time": other_time,
                             "draft_pct": draft_time / wall_time * 100 if wall_time > 0 else 0.0,
@@ -885,6 +893,12 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         prefill_time = sum(row.get("prefill_time", 0.0) for row in batch_rows)
         draft_time = sum(row.get("draft_time", 0.0) for row in batch_rows)
         target_time = sum(row.get("target_time", 0.0) for row in batch_rows)
+        target_backbone_time = sum(
+            row.get("target_backbone_time", 0.0) for row in batch_rows
+        )
+        target_lm_head_time = sum(
+            row.get("target_lm_head_time", 0.0) for row in batch_rows
+        )
         verify_time = sum(row.get("verify_time", 0.0) for row in batch_rows)
         other_time = sum(row.get("batch_other_time", 0.0) for row in batch_rows)
         decode_rounds = sum(row.get("iterations", 0) for row in batch_rows)
@@ -936,6 +950,8 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
             "prefill_time": prefill_time,
             "draft_time": draft_time,
             "target_time": target_time,
+            "target_backbone_time": target_backbone_time,
+            "target_lm_head_time": target_lm_head_time,
             "verify_time": verify_time,
             "iterations": decode_rounds,
             "active_sizes": active_sizes,

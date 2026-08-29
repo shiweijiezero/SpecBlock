@@ -1079,14 +1079,19 @@ def _project_tree_decisions(
     tree_width = last_hidden.shape[1]
     if any(int(width) <= 0 or int(width) > tree_width for width in tree_widths):
         raise ValueError("target tree widths are outside the staged query range")
-    widths = torch.tensor(
-        tree_widths, dtype=torch.long, device=last_hidden.device
-    )
-    valid = (
-        torch.arange(tree_width, device=last_hidden.device)[None, :]
-        < widths[:, None]
-    )
-    packed_hidden = last_hidden[valid]
+    unpadded_b1 = len(tree_widths) == 1 and int(tree_widths[0]) == tree_width
+    if unpadded_b1:
+        valid = None
+        packed_hidden = last_hidden[0]
+    else:
+        widths = torch.tensor(
+            tree_widths, dtype=torch.long, device=last_hidden.device
+        )
+        valid = (
+            torch.arange(tree_width, device=last_hidden.device)[None, :]
+            < widths[:, None]
+        )
+        packed_hidden = last_hidden[valid]
     packed_logits = algorithm.target_model.lm_head(packed_hidden)
 
     accept_topk = int(os.environ.get("ACCEPT_TOPK", "1"))
@@ -1096,20 +1101,28 @@ def _project_tree_decisions(
             f"ACCEPT_TOPK must be in [1, {vocab_size}], got {accept_topk}"
         )
 
-    node_argmax = torch.zeros(
-        last_hidden.shape[:2], dtype=torch.long, device=last_hidden.device
-    )
-    node_argmax[valid] = torch.argmax(packed_logits, dim=-1)
+    packed_argmax = torch.argmax(packed_logits, dim=-1)
+    if unpadded_b1:
+        node_argmax = packed_argmax.unsqueeze(0)
+    else:
+        node_argmax = torch.zeros(
+            last_hidden.shape[:2], dtype=torch.long, device=last_hidden.device
+        )
+        node_argmax[valid] = packed_argmax
     node_topk = None
     if accept_topk > 1:
-        node_topk = torch.zeros(
-            (*last_hidden.shape[:2], accept_topk),
-            dtype=torch.long,
-            device=last_hidden.device,
-        )
-        node_topk[valid] = torch.topk(
+        packed_topk = torch.topk(
             packed_logits, accept_topk, dim=-1
         ).indices
+        if unpadded_b1:
+            node_topk = packed_topk.unsqueeze(0)
+        else:
+            node_topk = torch.zeros(
+                (*last_hidden.shape[:2], accept_topk),
+                dtype=torch.long,
+                device=last_hidden.device,
+            )
+            node_topk[valid] = packed_topk
 
     sampling_logits = None
     if return_sampling_logits:
@@ -2330,6 +2343,7 @@ def generate_conversations(
         target_tree_widths.append(tree_width)
         target_commit_reserves.append(commit_reserve)
         target_start = phase_timer.start()
+        target_backbone_start = phase_timer.start()
         verify_hidden, verify_hidden_sources = _run_target_backbone(
             algorithm,
             input_ids=tree_input_ids,
@@ -2339,6 +2353,7 @@ def generate_conversations(
             attention_mask=additive_mask,
             use_cache=True,
         )
+        phase_timer.stop("target_backbone", target_backbone_start)
         if sampling:
             node_argmax = None
             node_topk = None
@@ -2346,6 +2361,7 @@ def generate_conversations(
                 algorithm, "_sampling_lm_head_rows", 0
             )
         else:
+            target_lm_head_start = phase_timer.start()
             (
                 node_argmax,
                 node_topk,
@@ -2358,6 +2374,7 @@ def generate_conversations(
                 return_sampling_logits=False,
             )
             target_verify_lm_head_rows += projected_rows
+            phase_timer.stop("target_lm_head", target_lm_head_start)
         target_verify_lm_head_capacity += len(active) * tree_width
         phase_timer.stop("target", target_start)
 
@@ -2480,6 +2497,8 @@ def generate_conversations(
     prefill_time = phase_timer.elapsed_seconds("prefill")
     draft_time = phase_timer.elapsed_seconds("draft")
     target_time = phase_timer.elapsed_seconds("target")
+    target_backbone_time = phase_timer.elapsed_seconds("target_backbone")
+    target_lm_head_time = phase_timer.elapsed_seconds("target_lm_head")
     verify_time = phase_timer.elapsed_seconds("verify")
     other_time = max(
         0.0, batch_wall_time - prefill_time - draft_time - target_time - verify_time
@@ -2503,6 +2522,8 @@ def generate_conversations(
         "batch_prefill_time": prefill_time,
         "batch_draft_time": draft_time,
         "batch_target_time": target_time,
+        "batch_target_backbone_time": target_backbone_time,
+        "batch_target_lm_head_time": target_lm_head_time,
         "batch_verify_time": verify_time,
         "batch_other_time": other_time,
         "batch_decode_rounds": len(active_sizes),
@@ -2541,6 +2562,8 @@ def generate_conversations(
         "prefill_time": prefill_time,
         "draft_time": draft_time,
         "target_time": target_time,
+        "target_backbone_time": target_backbone_time,
+        "target_lm_head_time": target_lm_head_time,
         "verify_time": verify_time,
         "iterations": len(active_sizes),
         "engine_batch_size": len(states),

@@ -102,7 +102,11 @@ def _require_biasless(linears: tuple[nn.Linear, ...], name: str) -> None:
         raise ValueError(f"{name} fusion requires bias-free projections")
 
 
-def fuse_llama_target_projections(model: nn.Module) -> None:
+def fuse_llama_target_projections(
+    model: nn.Module,
+    *,
+    gate_up_fuse_min_rows: int = 129,
+) -> None:
     """Use native packed GEMMs for small-row QKV and large-row gate/up."""
     layers = getattr(getattr(model, "model", None), "layers", None)
     if layers is None:
@@ -127,7 +131,7 @@ def fuse_llama_target_projections(model: nn.Module) -> None:
         _require_biasless(gate_up, "gate/up")
         packed_gate_up = _PackedProjection(
             tuple(projection.weight.detach() for projection in gate_up),
-            fuse_min_rows=129,
+            fuse_min_rows=gate_up_fuse_min_rows,
         )
         mlp.fused_gate_up_proj = packed_gate_up
         mlp.gate_proj = _ProjectionView(packed_gate_up, 0)

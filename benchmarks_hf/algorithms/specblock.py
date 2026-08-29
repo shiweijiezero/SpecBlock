@@ -52,6 +52,7 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
     def load_model(self):
         """Load target model and SpecBlock Shift draft model."""
         # Load target model (reuse parent logic for everything except draft model import)
+        from .hf_fused_projections import fuse_llama_target_projections
         from .specblock_inference_model import SpecBlockInferenceModel
         from safetensors.torch import load_file
         from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
@@ -80,6 +81,22 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         self.target_model = AutoModelForCausalLM.from_pretrained(
             self.model_path, **_load_kwargs
         )
+        if (
+            RUNTIME_CAPABILITIES.enable_target_projection_fusion
+            and os.environ.get("SPECBLOCK_HYBRID_B1", "0") == "1"
+        ):
+            gate_up_fuse_min_rows = int(
+                os.environ.get(
+                    "TARGET_GATE_UP_FUSE_MIN_ROWS",
+                    str(RUNTIME_CAPABILITIES.target_gate_up_fuse_min_rows),
+                )
+            )
+            if gate_up_fuse_min_rows <= 0:
+                raise ValueError("TARGET_GATE_UP_FUSE_MIN_ROWS must be positive")
+            fuse_llama_target_projections(
+                self.target_model,
+                gate_up_fuse_min_rows=gate_up_fuse_min_rows,
+            )
         self._assert_target_runtime_contract(self.target_model)
         self.target_model.eval()
 
