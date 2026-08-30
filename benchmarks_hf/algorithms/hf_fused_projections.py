@@ -196,6 +196,7 @@ def fuse_llama_target_projections(
     gate_up_fuse_min_rows: int = 129,
     fuse_silu_and_mul: bool = False,
     fuse_post_attention_norm: bool = False,
+    fuse_mlp_residual: bool = False,
 ) -> None:
     """Use native packed GEMMs for small-row QKV and large-row gate/up."""
     silu_and_mul = None
@@ -240,7 +241,7 @@ def fuse_llama_target_projections(
         mlp.up_proj = _ProjectionView(packed_gate_up, 1)
         if silu_and_mul is not None:
             layer.mlp = _FusedSiluMLP(
-                mlp, silu_and_mul, fuse_residual=False
+                mlp, silu_and_mul, fuse_residual=fuse_mlp_residual
             )
         if fused_add_rmsnorm is not None:
             object.__setattr__(
