@@ -23,6 +23,7 @@ class RuntimeCapabilities:
     needs_ragged_condition_fallback: bool = False
     use_shared_target_kv_storage: bool = False
     use_native_tree_builder: bool = False
+    fuse_target_mlp_residual: bool = False
     enable_target_projection_fusion: bool = False
     target_gate_up_fuse_min_rows: int = 129
 
@@ -59,6 +60,7 @@ def _detect_runtime_capabilities() -> RuntimeCapabilities:
             needs_ragged_condition_fallback=True,
             use_shared_target_kv_storage=True,
             use_native_tree_builder=True,
+            fuse_target_mlp_residual=True,
             enable_target_projection_fusion=True,
             target_gate_up_fuse_min_rows=80,
         )

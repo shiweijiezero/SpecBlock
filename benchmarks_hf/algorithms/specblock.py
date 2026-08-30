@@ -32,6 +32,8 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
         'TREE_ATTN_TRITON':         '1',         # triton attn kernel for draft
         'TREE_ATTN_SDPA':           '0',         # 关掉 SDPA (TRITON 赢在 short prompt)
         'TREE_BUILD_TRITON':        '1',         # triton mega tree build
+        'TREE_BUILD_CUDA':          '1' if RUNTIME_CAPABILITIES.use_native_tree_builder else '0',
+        'TREE_FIXED_N':             '0',
         'TREE_FINALIZE_CUDA':       '1',         # GPU-resident finalize
         'BFS_EVENTS':               '0',         # skip per-block CUDA event (省 launch)
         'TARGET_ATTN_IMPL':         'sdpa',       # high-throughput target attention
@@ -104,6 +106,12 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
                 ),
                 fuse_post_attention_norm=(
                     os.environ.get("TARGET_FUSED_ADD_NORM", "1") == "1"
+                ),
+                fuse_mlp_residual=(
+                    os.environ.get(
+                        "TARGET_FUSED_MLP_RESIDUAL",
+                        "1" if RUNTIME_CAPABILITIES.fuse_target_mlp_residual else "0",
+                    ) == "1"
                 ),
             )
         self._assert_target_runtime_contract(self.target_model)
