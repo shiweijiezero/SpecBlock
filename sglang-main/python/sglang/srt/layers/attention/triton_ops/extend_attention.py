@@ -23,7 +23,7 @@ import triton.language as tl
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_metax_c500
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -60,7 +60,10 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     # Determine BLOCK_M, BLOCK_N, and num_warps based on hardware
-    if _is_hip:
+    if is_metax_c500():
+        BLOCK_M, BLOCK_N = (32, 32)
+        num_warps = 4
+    elif _is_hip:
         BLOCK_M, BLOCK_N = (64, 64)
         num_warps = 4
     else:

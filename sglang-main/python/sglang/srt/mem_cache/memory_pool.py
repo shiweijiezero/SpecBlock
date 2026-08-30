@@ -52,7 +52,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton,
     set_mla_kv_scale_buffer_triton,
 )
-from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils import is_cuda, is_hip, is_metax_c500, is_npu, next_power_of_2
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -90,6 +90,11 @@ def _set_kv_buffer_impl(
     same_kv_dim: bool = True,
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
+    if is_metax_c500() and same_kv_dim:
+        from sglang.srt.mem_cache.metax_kv_cache import store_kv_cache
+
+        store_kv_cache(k, v, k_cache, v_cache, indices, row_dim)
+        return
     if _is_cuda and same_kv_dim and can_use_store_cache(row_bytes):
         return store_cache(
             k.view(-1, row_dim),
