@@ -16,8 +16,13 @@ class RuntimeCapabilities:
     three_part_attention_num_warps: int | None = None
     three_part_attention_num_stages: int | None = None
     draft_compile_default: str = "2"
+    draft_compile_forward_default: str = "1"
+    draft_compile_update_default: str = "1"
+    draft_compile_ragged_default: str = "1"
     internal_prewarm_default: str = "1"
     needs_ragged_condition_fallback: bool = False
+    use_shared_target_kv_storage: bool = False
+    use_native_tree_builder: bool = False
     enable_target_projection_fusion: bool = False
     target_gate_up_fuse_min_rows: int = 129
 
@@ -43,12 +48,17 @@ def _detect_runtime_capabilities() -> RuntimeCapabilities:
         return RuntimeCapabilities(
             minimum_triton_query_tile=16,
             attention_block_n=32,
-            three_part_attention_block_n=16,
+            three_part_attention_block_n=32,
             three_part_attention_num_warps=1,
             three_part_attention_num_stages=1,
             draft_compile_default="2",
+            draft_compile_forward_default="0",
+            draft_compile_update_default="1",
+            draft_compile_ragged_default="0",
             internal_prewarm_default="1",
             needs_ragged_condition_fallback=True,
+            use_shared_target_kv_storage=True,
+            use_native_tree_builder=True,
             enable_target_projection_fusion=True,
             target_gate_up_fuse_min_rows=80,
         )

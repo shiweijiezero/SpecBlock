@@ -25,6 +25,9 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
     _PARETO_DEFAULTS = {
         # Draft kernel / tree build
         'DRAFT_COMPILE':            RUNTIME_CAPABILITIES.draft_compile_default,
+        'DRAFT_COMPILE_FORWARD':    RUNTIME_CAPABILITIES.draft_compile_forward_default,
+        'DRAFT_COMPILE_UPDATE':     RUNTIME_CAPABILITIES.draft_compile_update_default,
+        'DRAFT_COMPILE_RAGGED':     RUNTIME_CAPABILITIES.draft_compile_ragged_default,
         'SPECBLOCK_HYBRID_B1':      '0',         # experimental MetaX hybrid; opt in explicitly
         'TREE_ATTN_TRITON':         '1',         # triton attn kernel for draft
         'TREE_ATTN_SDPA':           '0',         # 关掉 SDPA (TRITON 赢在 short prompt)
@@ -96,6 +99,12 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
             fuse_llama_target_projections(
                 self.target_model,
                 gate_up_fuse_min_rows=gate_up_fuse_min_rows,
+                fuse_silu_and_mul=(
+                    os.environ.get("TARGET_FUSED_SILU", "1") == "1"
+                ),
+                fuse_post_attention_norm=(
+                    os.environ.get("TARGET_FUSED_ADD_NORM", "1") == "1"
+                ),
             )
         self._assert_target_runtime_contract(self.target_model)
         self.target_model.eval()
@@ -161,26 +170,25 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
             self.draft_model.update_cache_and_draft_eager = (
                 self.draft_model.update_cache_and_draft
             )
-            # Compiling the inference copy preserves parameter identity while
-            # avoiding retracing across repeated decoding iterations.
-            self.draft_model.forward_with_cache = torch.compile(
-                self.draft_model.forward_with_cache, **_compile_kwargs,
-            )
-            self.draft_model.update_cache_and_draft = torch.compile(
-                self.draft_model.update_cache_and_draft, **_compile_kwargs,
-            )
-            # Keep the request-batched ragged path eager: active B and padded N
-            # vary enough to trigger expensive mid-run recompiles.  B=1 has a
-            # stable batch dimension and retains the compiled fast path.
-            self.draft_model.update_cache_and_draft_ragged_b1 = torch.compile(
-                self.draft_model.update_cache_and_draft_ragged, **_compile_kwargs,
-            )
-            self.draft_model.update_cache_and_draft_ragged_from_condition_b1 = (
-                torch.compile(
-                    self.draft_model.update_cache_and_draft_ragged_from_condition,
+            if os.environ.get("DRAFT_COMPILE_FORWARD", "1") == "1":
+                self.draft_model.forward_with_cache = torch.compile(
+                    self.draft_model.forward_with_cache, **_compile_kwargs,
+                )
+            if os.environ.get("DRAFT_COMPILE_UPDATE", "1") == "1":
+                self.draft_model.update_cache_and_draft = torch.compile(
+                    self.draft_model.update_cache_and_draft,
                     **_compile_kwargs,
                 )
-            )
+            if os.environ.get("DRAFT_COMPILE_RAGGED", "1") == "1":
+                self.draft_model.update_cache_and_draft_ragged_b1 = torch.compile(
+                    self.draft_model.update_cache_and_draft_ragged, **_compile_kwargs,
+                )
+                self.draft_model.update_cache_and_draft_ragged_from_condition_b1 = (
+                    torch.compile(
+                        self.draft_model.update_cache_and_draft_ragged_from_condition,
+                        **_compile_kwargs,
+                    )
+                )
 
         # Vocab mapping
         vocab_mapping_path = os.path.join(self.draft_model_path, "vocab_mapping.pt")

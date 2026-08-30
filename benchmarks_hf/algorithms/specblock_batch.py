@@ -92,8 +92,14 @@ class _DenseTargetCacheLayer(CacheLayerMixin):
         self.write_start = 0
         self.gap_start = 0
         self.gap_mask = None
+        self.gap_cleared = False
+        self.owner = None
+        self.layer_index = -1
 
     def lazy_initialization(self, key_states: torch.Tensor):
+        if self.owner is not None:
+            self.owner._lazy_initialize_storage(key_states)
+            return
         self.max_batch_size, self.num_heads, _, self.head_dim = key_states.shape
         self.dtype = key_states.dtype
         self.device = key_states.device
@@ -126,23 +132,20 @@ class _DenseTargetCacheLayer(CacheLayerMixin):
         if write_end > self.max_cache_len or write_end > self.attention_width:
             raise ValueError("target KV write exceeds the prepared cache range")
         rows = slice(0, key_states.shape[0])
-        if self.gap_mask is None and self.write_start > self.committed_width:
-            gap = slice(self.committed_width, self.write_start)
-            # B=1/equal-prefix fast path: only the reserved accepted-path window
-            # is masked between committed KV and the staged tree.
-            self.keys[rows, :, gap, :].zero_()
-            self.values[rows, :, gap, :].zero_()
-        elif self.gap_mask is not None:
-            # Unequal-prefix batches also have row-local padding before the common
-            # tree start.  Clear every masked slot while preserving each row's
-            # committed prefix.  Some fused attention reductions still touch
-            # masked KV, so stale rejected nodes must remain numerically benign.
-            if self.gap_mask.shape[0] != key_states.shape[0]:
-                raise ValueError("target KV gap mask does not match active rows")
-            gap = slice(self.gap_start, self.write_start)
-            mask = self.gap_mask[:, None, :, None]
-            self.keys[rows, :, gap, :].masked_fill_(mask, 0)
-            self.values[rows, :, gap, :].masked_fill_(mask, 0)
+        if not self.gap_cleared:
+            if self.gap_mask is None and self.write_start > self.committed_width:
+                gap = slice(self.committed_width, self.write_start)
+                # Standalone cache layers retain the per-layer fallback.  Shared
+                # target storage clears this range once for every layer.
+                self.keys[rows, :, gap, :].zero_()
+                self.values[rows, :, gap, :].zero_()
+            elif self.gap_mask is not None:
+                if self.gap_mask.shape[0] != key_states.shape[0]:
+                    raise ValueError("target KV gap mask does not match active rows")
+                gap = slice(self.gap_start, self.write_start)
+                mask = self.gap_mask[:, None, :, None]
+                self.keys[rows, :, gap, :].masked_fill_(mask, 0)
+                self.values[rows, :, gap, :].masked_fill_(mask, 0)
         write_slice = slice(self.write_start, write_end)
         self.keys[rows, :, write_slice, :].copy_(key_states)
         self.values[rows, :, write_slice, :].copy_(value_states)
@@ -332,12 +335,64 @@ class _DenseTargetCache(Cache):
         self._tree_start = self.prompt_width
         self._tree_width = 0
         self._commit_reserve = 0
-        super().__init__(
-            layers=[
-                _DenseTargetCacheLayer(self.capacity) for _ in range(num_layers)
-            ]
+        self._keys = None
+        self._values = None
+        self._use_shared_storage = (
+            RUNTIME_CAPABILITIES.use_shared_target_kv_storage
         )
+        layers = [_DenseTargetCacheLayer(self.capacity) for _ in range(num_layers)]
+        super().__init__(layers=layers)
+        if self._use_shared_storage:
+            for layer_index, layer in enumerate(self.layers):
+                layer.owner = self
+                layer.layer_index = layer_index
         self._sync_layer_state(write_start=0)
+
+    def _lazy_initialize_storage(self, key_states: torch.Tensor):
+        if self._keys is not None:
+            return
+        batch_size, num_heads, _, head_dim = key_states.shape
+        shape = (
+            len(self.layers),
+            batch_size,
+            num_heads,
+            self.capacity,
+            head_dim,
+        )
+        self._keys = torch.zeros(shape, dtype=key_states.dtype, device=key_states.device)
+        self._values = torch.zeros_like(self._keys)
+        for layer_index, layer in enumerate(self.layers):
+            layer.max_batch_size = batch_size
+            layer.num_heads = num_heads
+            layer.head_dim = head_dim
+            layer.dtype = key_states.dtype
+            layer.device = key_states.device
+            layer.keys = self._keys[layer_index]
+            layer.values = self._values[layer_index]
+            layer.is_initialized = True
+
+    def _resize_storage(self, max_cache_len: int, preserve_width: int):
+        max_cache_len = int(max_cache_len)
+        if self._keys is None:
+            for layer in self.layers:
+                layer.max_cache_len = max_cache_len
+            return
+        shape = (*self._keys.shape[:3], max_cache_len, self._keys.shape[-1])
+        keys = torch.zeros(shape, dtype=self._keys.dtype, device=self._keys.device)
+        values = torch.zeros_like(keys)
+        if preserve_width:
+            keys[..., :preserve_width, :].copy_(
+                self._keys[..., :preserve_width, :]
+            )
+            values[..., :preserve_width, :].copy_(
+                self._values[..., :preserve_width, :]
+            )
+        self._keys = keys
+        self._values = values
+        for layer_index, layer in enumerate(self.layers):
+            layer.max_cache_len = max_cache_len
+            layer.keys = self._keys[layer_index]
+            layer.values = self._values[layer_index]
 
     def _sync_layer_state(
         self,
@@ -351,6 +406,7 @@ class _DenseTargetCache(Cache):
             layer.write_start = int(write_start)
             layer.gap_start = int(gap_start)
             layer.gap_mask = gap_mask
+            layer.gap_cleared = False
 
     def prepare_prefill(self):
         self.active_batch_size = self.max_batch_capacity
@@ -399,8 +455,11 @@ class _DenseTargetCache(Cache):
                 attention_width,
                 self.committed_capacity + 2 * self.max_tree_width,
             )
-            for layer in self.layers:
-                layer.resize(self.capacity, preserve_width=committed_width)
+            if self._use_shared_storage:
+                self._resize_storage(self.capacity, preserve_width=committed_width)
+            else:
+                for layer in self.layers:
+                    layer.resize(self.capacity, preserve_width=committed_width)
         self._attention_width = attention_width
         self._committed_width = committed_width
         self._tree_start = tree_start
@@ -428,6 +487,18 @@ class _DenseTargetCache(Cache):
             gap_start=gap_start,
             gap_mask=gap_mask,
         )
+        if self._keys is not None and tree_start > gap_start:
+            rows = slice(0, self.active_batch_size)
+            gap = slice(gap_start, tree_start)
+            if gap_mask is None:
+                self._keys[:, rows, :, gap, :].zero_()
+                self._values[:, rows, :, gap, :].zero_()
+            else:
+                mask = gap_mask[None, :, None, :, None]
+                self._keys[:, rows, :, gap, :].masked_fill_(mask, 0)
+                self._values[:, rows, :, gap, :].masked_fill_(mask, 0)
+            for layer in self.layers:
+                layer.gap_cleared = True
 
     def tree_cache_position(self, tree_width: int, device: torch.device):
         tree_width = int(tree_width)
@@ -494,10 +565,15 @@ class _DenseTargetCache(Cache):
             "accepted target KV source is out of range",
         )
         sources.add_(self._tree_start)
-        from algorithms.target_kv_copy_triton import copy_selected_kv_
+        if self._use_shared_storage:
+            from algorithms.target_kv_copy_triton import copy_selected_kv_layers_
 
-        for layer in self.layers:
-            copy_selected_kv_(layer.keys, layer.values, metadata, sources)
+            copy_selected_kv_layers_(self._keys, self._values, metadata, sources)
+        else:
+            from algorithms.target_kv_copy_triton import copy_selected_kv_
+
+            for layer in self.layers:
+                copy_selected_kv_(layer.keys, layer.values, metadata, sources)
         self._committed_width = committed_width
         return counts
 
@@ -2264,7 +2340,7 @@ def generate_conversations(
     if initial_entries:
         if use_legacy_compiled_b1:
             if len(initial_entries) != 1:
-                raise RuntimeError("compiled B1 draft requires exactly one active request")
+                raise RuntimeError("legacy B1 draft requires exactly one active request")
             source_idx, state = initial_entries[0]
             prompt_hidden = torch.cat(
                 [
@@ -2476,7 +2552,7 @@ def generate_conversations(
             if use_legacy_compiled_b1:
                 if len(next_active) != 1:
                     raise RuntimeError(
-                        "compiled B1 draft rebuild requires one active request"
+                        "legacy B1 draft rebuild requires one active request"
                     )
                 _build_next_draft(algorithm, *next_active[0])
             else:
