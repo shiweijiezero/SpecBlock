@@ -138,6 +138,16 @@ def is_cuda_alike():
 
 
 @lru_cache(maxsize=1)
+def is_metax_c500() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_name(0).strip().lower() == "metax c500"
+    except RuntimeError:
+        return False
+
+
+@lru_cache(maxsize=1)
 def is_hpu() -> bool:
     return hasattr(torch, "hpu") and torch.hpu.is_available()
 
@@ -1762,7 +1772,9 @@ def get_xpu_memory_capacity():
 
 
 def get_device_memory_capacity(device: str = None):
-    if is_cuda():
+    if is_metax_c500():
+        gpu_mem = torch.cuda.get_device_properties(0).total_memory // 1024 // 1024
+    elif is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()

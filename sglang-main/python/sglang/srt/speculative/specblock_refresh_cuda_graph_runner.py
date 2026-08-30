@@ -21,9 +21,11 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.utils import is_metax_c500
+
 if TYPE_CHECKING:
-    from sglang.srt.speculative.specblock_worker import (
-        SpecBlockWorker,
+    from sglang.srt.speculative.specblock_shift_worker import (
+        SpecBlockShiftWorker,
     )
 
 logger = logging.getLogger(__name__)
@@ -56,7 +58,7 @@ _MAX_BATCH_CAPACITY = 16
 class SpecBlockRefreshCudaGraphRunner:
     """Capture and replay the batched SpecBlock refresh model forward."""
 
-    def __init__(self, worker: "SpecBlockWorker"):
+    def __init__(self, worker: "SpecBlockShiftWorker"):
         self.worker = worker
         self.device = worker.device
         self.K = worker.K
@@ -79,7 +81,9 @@ class SpecBlockRefreshCudaGraphRunner:
         self.capture_bs.append(configured_max)
 
         self.cross_buckets = _CROSS_BUCKETS
-        self.accept_buckets = _ACCEPT_BUCKETS
+        self.accept_buckets = (
+            tuple(range(1, 17)) if is_metax_c500() else _ACCEPT_BUCKETS
+        )
         self.graphs: Dict[
             Tuple[int, int, int], torch.cuda.CUDAGraph
         ] = {}
@@ -268,14 +272,24 @@ class SpecBlockRefreshCudaGraphRunner:
             torch.cuda.synchronize()
 
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self.graph_pool):
-                (
-                    logits,
-                    rank_logits,
-                    draft_hidden,
-                    new_cross_kv,
-                    new_ttt_kv,
-                ) = run_forward()
+            if is_metax_c500():
+                with torch.cuda.graph(graph):
+                    (
+                        logits,
+                        rank_logits,
+                        draft_hidden,
+                        new_cross_kv,
+                        new_ttt_kv,
+                    ) = run_forward()
+            else:
+                with torch.cuda.graph(graph, pool=self.graph_pool):
+                    (
+                        logits,
+                        rank_logits,
+                        draft_hidden,
+                        new_cross_kv,
+                        new_ttt_kv,
+                    ) = run_forward()
 
         self.graphs[key] = graph
         self.output_buffers[key] = {
@@ -427,20 +441,60 @@ class SpecBlockRefreshCudaGraphRunner:
             cross_mask,
             n_per_req,
         )
-        self.graphs[key].replay()
+        if is_metax_c500() and accept_bucket < 4:
+            draft_model = self.worker.model_runner.model.inner
+            rope_max_position = min(
+                int(getattr(draft_model.config, "max_position_embeddings", 131072)),
+                int(draft_model.layers[0].self_attn.rope.max_pos),
+            ) - 1
+            cache = [
+                [
+                    self.worker.spec_kv_pool,
+                    layer_idx,
+                    cross_bucket,
+                    in_buf["cross_loc"],
+                    None,
+                ]
+                for layer_idx in range(self.num_layers)
+            ]
+            (
+                logits,
+                rank_logits,
+                draft_hidden,
+                new_cross_kv,
+                new_ttt_kv,
+            ) = draft_model.update_cache_and_draft_graph_safe(
+                in_buf["hidden"],
+                in_buf["tokens"],
+                in_buf["pos_ids"],
+                cache,
+                rope_max_position,
+                accept_bucket,
+                in_buf["cross_mask"],
+                in_buf["n_per_req"],
+            )
+            top_indices = draft_model._last_rank_top_indices
+        else:
+            self.graphs[key].replay()
+            out = self.output_buffers[key]
+            logits = out["logits"]
+            rank_logits = out["rank_logits"]
+            draft_hidden = out["draft_hidden"]
+            new_cross_kv = out["new_cross_kv"]
+            new_ttt_kv = out["new_ttt_kv"]
+            top_indices = out["top_indices"]
 
-        out = self.output_buffers[key]
         return (
-            out["logits"][:active_bs],
-            out["rank_logits"][:active_bs],
-            out["draft_hidden"][:active_bs],
+            logits[:active_bs],
+            rank_logits[:active_bs],
+            draft_hidden[:active_bs],
             [
                 (layer_k[:active_bs], layer_v[:active_bs])
-                for layer_k, layer_v in out["new_cross_kv"]
+                for layer_k, layer_v in new_cross_kv
             ],
             [
                 (layer_k[:active_bs], layer_v[:active_bs])
-                for layer_k, layer_v in out["new_ttt_kv"]
+                for layer_k, layer_v in new_ttt_kv
             ],
-            out["top_indices"][:active_bs],
+            top_indices[:active_bs],
         )

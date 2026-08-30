@@ -2,6 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from sgl_kernel import verify_tree_greedy
+from sgl_kernel.metax_speculative import verify_tree_greedy as verify_tree_greedy_metax
 
 
 def test_verify_tree_greedy():
@@ -80,6 +81,23 @@ def test_verify_tree_greedy():
         [0, 3, 4, 5],
         [6, 10, 11, -1],
     ]
+    assert accept_token_num.tolist() == [3, 2]
+
+    predicts.fill_(-1)
+    accept_index.fill_(-1)
+    accept_token_num.zero_()
+    verify_tree_greedy_metax(
+        predicts=predicts,
+        accept_index=accept_index,
+        accept_token_num=accept_token_num,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        retrive_next_token=retrive_next_token,
+        retrive_next_sibling=retrive_next_sibling,
+        target_predict=target_predict,
+    )
+    assert predicts.tolist() == [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18]
+    assert accept_index.tolist() == [[0, 3, 4, 5], [6, 10, 11, -1]]
     assert accept_token_num.tolist() == [3, 2]
 
 

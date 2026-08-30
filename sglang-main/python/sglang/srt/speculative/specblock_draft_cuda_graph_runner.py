@@ -48,8 +48,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.utils import is_metax_c500
+
 if TYPE_CHECKING:
-    from sglang.srt.speculative.specblock_worker import SpecBlockWorker
+    from sglang.srt.speculative.specblock_shift_worker import SpecBlockShiftWorker
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,7 @@ _PEND_BUCKETS: Tuple[int, ...] = (16, 32, 64)
 
 
 class SpecBlockDraftCudaGraphRunner:
-    """CUDA graph runner for SpecBlockWorker's build_tree GPU chain.
+    """CUDA graph runner for SpecBlockShiftWorker's build_tree GPU chain.
 
     Lifecycle::
 
@@ -77,7 +79,7 @@ class SpecBlockDraftCudaGraphRunner:
     triggers ``capture_one`` then replays.  Unsupported shapes fail explicitly.
     """
 
-    def __init__(self, worker: "SpecBlockWorker"):
+    def __init__(self, worker: "SpecBlockShiftWorker"):
         self.worker = worker
         self.device = worker.device
         self.K = worker.K
@@ -100,7 +102,15 @@ class SpecBlockDraftCudaGraphRunner:
         self.capture_bs.append(configured_max_bs)
         self.max_bs = configured_max_bs
 
-        self.cross_buckets = _CROSS_BUCKETS
+        self.cross_buckets = (
+            (
+                *range(128, 2049, 128),
+                2304, 2560, 2816, 3072, 3584, 4096,
+                5120, 6144, 7168, 8192, 10240, 12288, 14336, 16384,
+            )
+            if is_metax_c500()
+            else _CROSS_BUCKETS
+        )
         self.pend_buckets = _PEND_BUCKETS
         self.max_cross = self.cross_buckets[-1]
         self.max_pend = self.pend_buckets[-1]
@@ -520,7 +530,6 @@ class SpecBlockDraftCudaGraphRunner:
         """
         from sglang.srt.speculative.specblock_tree_kernels import (
             build_tree_gpu_batched_capturable_region,
-            finalize_tree_fixed_batched,
         )
 
         build_tree_gpu_batched_capturable_region(
@@ -546,6 +555,14 @@ class SpecBlockDraftCudaGraphRunner:
                 self.worker.model_runner.model.inner, "d2t", None,
             ),
             scratch=scratch,
+        )
+
+        if not is_metax_c500():
+            self._finalize_chain(in_buf, scratch)
+
+    def _finalize_chain(self, in_buf: dict, scratch: dict) -> None:
+        from sglang.srt.speculative.specblock_tree_kernels import (
+            finalize_tree_fixed_batched,
         )
 
         sizes4 = scratch["sizes4"]
@@ -597,6 +614,8 @@ class SpecBlockDraftCudaGraphRunner:
             in_buf, spec_info, active_bs=active_bs, cb=cb
         )
         g.replay()
+        if is_metax_c500():
+            self._finalize_chain(in_buf, scratch)
 
         return pack_fixed_tree_outputs(
             sb_batch=scratch,

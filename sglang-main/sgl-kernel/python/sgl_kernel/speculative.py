@@ -1,4 +1,16 @@
+from functools import lru_cache
+
 import torch
+
+
+@lru_cache(maxsize=1)
+def _is_metax_c500() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_name(0).strip().lower() == "metax c500"
+    except RuntimeError:
+        return False
 
 
 def tree_speculative_sampling_target_only(
@@ -45,6 +57,23 @@ def verify_tree_greedy(
     retrive_next_sibling: torch.Tensor,
     target_predict: torch.Tensor,
 ) -> None:
+    if _is_metax_c500():
+        from sgl_kernel.metax_speculative import (
+            verify_tree_greedy as verify_tree_greedy_metax,
+        )
+
+        verify_tree_greedy_metax(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            target_predict,
+        )
+        return
+
     torch.ops.sgl_kernel.verify_tree_greedy.default(
         predicts,
         accept_index,

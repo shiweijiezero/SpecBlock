@@ -29,6 +29,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_metax_c500
+
 
 # =============================================================================
 #   Constants
@@ -1824,6 +1826,301 @@ def _finalize_one_block_fixed_kernel(
     )
 
 
+@triton.jit
+def _pack_depth_topology_kernel(
+    raw_tokens_ptr,
+    raw_parents_ptr,
+    raw_lps_ptr,
+    kept_idx_ptr,
+    kept_valid_ptr,
+    sample_tokens_ptr,
+    seq_lens_ptr,
+    out_tokens_ptr,
+    out_parents_ptr,
+    out_topo_parents_ptr,
+    out_lps_ptr,
+    out_depth_ptr,
+    out_positions_ptr,
+    out_retrieve_index_ptr,
+    stride_raw: tl.constexpr,
+    stride_kept: tl.constexpr,
+    stride_out: tl.constexpr,
+    N: tl.constexpr,
+    BUDGET: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MAX_DEPTH: tl.constexpr,
+):
+    """Stage 1: pack values and derive topology without an outer product."""
+    b = tl.program_id(0)
+    node = tl.arange(0, BLOCK_N)
+    nonroot = node - 1
+    in_tree = node < N
+    is_root = node == 0
+    is_nonroot = (node > 0) & in_tree
+
+    kept = tl.load(
+        kept_idx_ptr + b * stride_kept + nonroot,
+        mask=is_nonroot,
+        other=0,
+    ).to(tl.int64)
+    keep = tl.load(
+        kept_valid_ptr + b * stride_kept + nonroot,
+        mask=is_nonroot,
+        other=0,
+    ).to(tl.int1)
+    valid_nonroot = is_nonroot & keep
+
+    old_parent = tl.load(
+        raw_parents_ptr + b * stride_raw + kept,
+        mask=valid_nonroot,
+        other=-1,
+    ).to(tl.int64)
+
+    # Each node carries only one candidate parent id.  This serial candidate
+    # search avoids the BLOCK_N x BLOCK_N SSA tensor in the old kernel.
+    mapped_parent = tl.full((BLOCK_N,), -1, tl.int64)
+    for candidate in tl.static_range(0, BUDGET):
+        candidate_old = tl.load(
+            kept_idx_ptr + b * stride_kept + candidate
+        ).to(tl.int64)
+        candidate_valid = tl.load(
+            kept_valid_ptr + b * stride_kept + candidate
+        ).to(tl.int1)
+        mapped_parent = tl.where(
+            valid_nonroot
+            & (old_parent >= 0)
+            & candidate_valid
+            & (old_parent == candidate_old),
+            candidate,
+            mapped_parent,
+        )
+
+    raw_parent_out = tl.where(
+        is_root,
+        -1,
+        tl.where(valid_nonroot, tl.where(old_parent >= 0, mapped_parent, -1), -2),
+    )
+    topo_parent = tl.where(
+        valid_nonroot,
+        tl.where(raw_parent_out >= 0, raw_parent_out + 1, 0),
+        -1,
+    )
+
+    sample = tl.load(sample_tokens_ptr + b)
+    token = tl.load(
+        raw_tokens_ptr + b * stride_raw + kept,
+        mask=valid_nonroot,
+        other=0,
+    )
+    lp = tl.load(
+        raw_lps_ptr + b * stride_raw + kept,
+        mask=valid_nonroot,
+        other=float("-inf"),
+    )
+
+    cur_old = kept
+    active = valid_nonroot
+    depth = tl.zeros((BLOCK_N,), dtype=tl.int64)
+    for _ in tl.static_range(0, MAX_DEPTH):
+        depth += active.to(tl.int64)
+        parent_old = tl.load(
+            raw_parents_ptr + b * stride_raw + cur_old,
+            mask=active,
+            other=-1,
+        ).to(tl.int64)
+        active = active & (parent_old >= 0)
+        cur_old = tl.where(active, parent_old, cur_old)
+
+    seq_len = tl.load(seq_lens_ptr + b).to(tl.int64)
+    out = b * stride_out + node
+    tl.store(out_tokens_ptr + out, tl.where(is_root, sample, token), mask=in_tree)
+    tl.store(out_parents_ptr + out, raw_parent_out, mask=in_tree)
+    tl.store(out_topo_parents_ptr + out, topo_parent, mask=in_tree)
+    tl.store(out_lps_ptr + out, tl.where(is_root, 0.0, lp), mask=in_tree)
+    tl.store(out_depth_ptr + out, depth, mask=in_tree)
+    tl.store(out_positions_ptr + out, depth + seq_len, mask=in_tree)
+    tl.store(out_retrieve_index_ptr + out, node + b * N, mask=in_tree)
+
+
+@triton.jit
+def _ancestor_mask_row_kernel(
+    raw_parents_ptr,
+    kept_idx_ptr,
+    kept_valid_ptr,
+    out_mask_ptr,
+    stride_raw: tl.constexpr,
+    stride_kept: tl.constexpr,
+    stride_mask: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    MAX_DEPTH: tl.constexpr,
+):
+    """Stage 2: one program writes one query's N-wide ancestor mask row."""
+    pid = tl.program_id(0)
+    b = pid // N
+    q = pid - b * N
+    key = tl.arange(0, BLOCK_N)
+    in_tree = key < N
+
+    q_is_root = q == 0
+    q_nonroot = q > 0
+    q_old = tl.load(
+        kept_idx_ptr + b * stride_kept + (q - 1), mask=q_nonroot, other=0
+    ).to(tl.int64)
+    q_valid = tl.load(
+        kept_valid_ptr + b * stride_kept + (q - 1), mask=q_nonroot, other=0
+    ).to(tl.int1)
+
+    key_old = tl.load(
+        kept_idx_ptr + b * stride_kept + (key - 1),
+        mask=(key > 0) & in_tree,
+        other=-2,
+    ).to(tl.int64)
+
+    visible = (q_is_root & (key == 0)) | ((q_nonroot & ~q_valid) & (key == q))
+    visible |= q_nonroot & q_valid & (key == 0)
+
+    current = q_old
+    active = q_nonroot & q_valid
+    for _ in tl.static_range(0, MAX_DEPTH):
+        visible |= active & (key > 0) & in_tree & (key_old == current)
+        parent = tl.load(
+            raw_parents_ptr + b * stride_raw + current, mask=active, other=-1
+        ).to(tl.int64)
+        active = active & (parent >= 0)
+        current = tl.where(active, parent, current)
+
+    tl.store(
+        out_mask_ptr + b * stride_mask + q * N + key,
+        visible,
+        mask=in_tree,
+    )
+
+
+@triton.jit
+def _topology_links_row_kernel(
+    topo_parents_ptr,
+    kept_valid_ptr,
+    out_next_token_ptr,
+    out_next_sibling_ptr,
+    stride_kept: tl.constexpr,
+    stride_out: tl.constexpr,
+    N: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Stage 3: one program finds one node's first child and sibling."""
+    pid = tl.program_id(0)
+    b = pid // N
+    q = pid - b * N
+    candidate = tl.arange(0, BLOCK_N)
+    in_tree = candidate < N
+    candidate_nonroot = (candidate > 0) & in_tree
+    candidate_valid = tl.load(
+        kept_valid_ptr + b * stride_kept + (candidate - 1),
+        mask=candidate_nonroot,
+        other=0,
+    ).to(tl.int1)
+    candidate_parent = tl.load(
+        topo_parents_ptr + b * stride_out + candidate,
+        mask=in_tree,
+        other=-1,
+    ).to(tl.int64)
+    q_parent = tl.load(topo_parents_ptr + b * stride_out + q).to(tl.int64)
+    q_valid = (q == 0) | tl.load(
+        kept_valid_ptr + b * stride_kept + (q - 1), mask=q > 0, other=0
+    ).to(tl.int1)
+
+    inf = N + 1
+    child = tl.min(
+        tl.where(
+            candidate_nonroot & candidate_valid & (candidate_parent == q),
+            candidate,
+            inf,
+        ),
+        axis=0,
+    )
+    sibling = tl.min(
+        tl.where(
+            candidate_nonroot
+            & candidate_valid
+            & (candidate > q)
+            & (q > 0)
+            & q_valid
+            & (candidate_parent == q_parent),
+            candidate,
+            inf,
+        ),
+        axis=0,
+    )
+    out = b * stride_out + q
+    tl.store(out_next_token_ptr + out, tl.where(child < inf, child, -1))
+    tl.store(out_next_sibling_ptr + out, tl.where(sibling < inf, sibling, -1))
+
+def _finalize_one_block_fixed_metax(
+    tree_buf_b,
+    kept_idx,
+    kept_valid,
+    sample_tokens_b,
+    seq_lens_b,
+    out,
+    budget,
+):
+    """Build fixed topology with three low-memory Triton stages on C500."""
+    batch_size = kept_idx.shape[0]
+    tree_tokens = budget + 1
+    block_n = triton.next_power_of_2(tree_tokens)
+    _pack_depth_topology_kernel[(batch_size,)](
+        tree_buf_b["tokens"],
+        tree_buf_b["parents"],
+        tree_buf_b["lps"],
+        kept_idx,
+        kept_valid,
+        sample_tokens_b[:, 0],
+        seq_lens_b,
+        out["tokens"],
+        out["parents"],
+        out["topo_parents"],
+        out["lps"],
+        out["depth"],
+        out["positions"],
+        out["retrieve_index"],
+        tree_buf_b["tokens"].shape[1],
+        budget,
+        tree_tokens,
+        N=tree_tokens,
+        BUDGET=budget,
+        BLOCK_N=block_n,
+        MAX_DEPTH=MAX_TREE_DEPTH,
+        num_warps=4,
+        num_stages=1,
+    )
+    _ancestor_mask_row_kernel[(batch_size * tree_tokens,)](
+        tree_buf_b["parents"],
+        kept_idx,
+        kept_valid,
+        out["mask"],
+        tree_buf_b["tokens"].shape[1],
+        budget,
+        tree_tokens * tree_tokens,
+        N=tree_tokens,
+        BLOCK_N=block_n,
+        MAX_DEPTH=MAX_TREE_DEPTH,
+        num_warps=4,
+        num_stages=1,
+    )
+    _topology_links_row_kernel[(batch_size * tree_tokens,)](
+        out["topo_parents"],
+        kept_valid,
+        out["next_token"],
+        out["next_sibling"],
+        budget,
+        tree_tokens,
+        N=tree_tokens,
+        BLOCK_N=block_n,
+        num_warps=4,
+        num_stages=1,
+    )
+
 def finalize_one_block_fixed_batched(
     tree_buf_b: dict,
     raw_sizes_b: torch.Tensor,
@@ -1953,16 +2250,27 @@ def finalize_one_block_fixed_batched(
         }
         fast_outputs[shape_key] = out
 
-    block_n = triton.next_power_of_2(N)
-    _finalize_one_block_fixed_kernel[(B,)](
-        tree_buf_b["tokens"], tree_buf_b["parents"], tree_buf_b["lps"],
-        kept_idx, kept_valid, sample_tokens_b[:, 0], seq_lens_b,
-        out["tokens"], out["parents"], out["topo_parents"],
-        out["lps"], out["depth"], out["positions"], out["mask"],
-        out["retrieve_index"], out["next_token"], out["next_sibling"],
-        tree_buf_b["tokens"].shape[1], budget, N, N * N,
-        N=N, BUDGET=budget, BLOCK_N=block_n, MAX_DEPTH=MAX_TREE_DEPTH,
-    )
+    if is_metax_c500():
+        _finalize_one_block_fixed_metax(
+            tree_buf_b,
+            kept_idx,
+            kept_valid,
+            sample_tokens_b,
+            seq_lens_b,
+            out,
+            budget,
+        )
+    else:
+        block_n = triton.next_power_of_2(N)
+        _finalize_one_block_fixed_kernel[(B,)](
+            tree_buf_b["tokens"], tree_buf_b["parents"], tree_buf_b["lps"],
+            kept_idx, kept_valid, sample_tokens_b[:, 0], seq_lens_b,
+            out["tokens"], out["parents"], out["topo_parents"],
+            out["lps"], out["depth"], out["positions"], out["mask"],
+            out["retrieve_index"], out["next_token"], out["next_sibling"],
+            tree_buf_b["tokens"].shape[1], budget, N, N * N,
+            N=N, BUDGET=budget, BLOCK_N=block_n, MAX_DEPTH=MAX_TREE_DEPTH,
+        )
 
     return pack_fixed_tree_outputs(
         sb_batch=sb_batch,

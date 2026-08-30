@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.utils import is_metax_c500
+
 
 @triton.jit
 def _specblock_tree_verify_fwd_kernel(
@@ -189,8 +191,12 @@ def specblock_tree_verify_attention_fwd(
     if kv_indptr.numel() < batch_size + 1 or mask_indptr.numel() < batch_size + 1:
         raise RuntimeError("SpecBlock target verifier metadata is smaller than the active batch.")
 
-    block_m = 32
-    block_n = 128
+    if is_metax_c500():
+        block_m, block_n = 16, 32
+        launch_kwargs = {"num_warps": 2, "num_stages": 1}
+    else:
+        block_m, block_n = 32, 128
+        launch_kwargs = {"num_warps": 4, "num_stages": 2}
     grid = (triton.cdiv(tree_tokens, block_m), batch_size, num_q_heads)
     _specblock_tree_verify_fwd_kernel[grid](
         q,
@@ -215,6 +221,5 @@ def specblock_tree_verify_attention_fwd(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         D=head_dim,
-        num_warps=4,
-        num_stages=2,
+        **launch_kwargs,
     )
