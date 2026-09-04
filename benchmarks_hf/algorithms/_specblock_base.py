@@ -464,6 +464,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
     """
 
     supports_true_batch = False
+    target_model_types = frozenset({"llama"})
 
     def __init__(
         self,
@@ -1016,7 +1017,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         layers = getattr(backbone, "layers", None)
         lm_head = getattr(target_model, "lm_head", None)
         if (
-            getattr(config, "model_type", None) != "llama"
+            getattr(config, "model_type", None) not in cls.target_model_types
             or not isinstance(layers, torch.nn.ModuleList)
             or len(layers) != int(config.num_hidden_layers)
             or not callable(getattr(backbone, "forward", None))
@@ -1026,7 +1027,7 @@ class _SpecBlockAlgorithmBase(BaseAlgorithm):
         ):
             raise RuntimeError(
                 "HF SpecBlock target batching requires the validated "
-                "LlamaForCausalLM model/layers/lm_head contract"
+                "decoder-only model/layers/lm_head contract"
             )
 
     def load_model(self):

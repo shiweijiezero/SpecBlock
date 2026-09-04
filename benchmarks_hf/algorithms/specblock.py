@@ -18,6 +18,8 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
     _SpecBlockAlgorithmBase. Only overrides load_model() to use the shift inference model.
     """
 
+    target_model_types = frozenset({"llama", "qwen3"})
+
     # Day 22 Pareto config — 8-bench unified avg 104.96 tp, humaneval 133.27
     # 超 Eagle3 官方 130.72 (+1.9%). Env vars here default-on so CLI/UI/offline
     # eval gets the best config out-of-box without any export. Users can still
@@ -87,7 +89,8 @@ class SpecBlockAlgorithm(_SpecBlockAlgorithmBase):
             self.model_path, **_load_kwargs
         )
         if (
-            RUNTIME_CAPABILITIES.enable_target_projection_fusion
+            self.target_model.config.model_type == "llama"
+            and RUNTIME_CAPABILITIES.enable_target_projection_fusion
             and os.environ.get("SPECBLOCK_HYBRID_B1", "0") == "1"
         ):
             gate_up_fuse_min_rows = int(
